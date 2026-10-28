@@ -623,7 +623,7 @@ pub fn claim_scheduler_session(
     workspace_id: WorkspaceId,
     project_id: ProjectId,
     session_id: SessionId,
-    ended_at: i64,
+    ended_at: Option<i64>,
 ) -> StoreResult<bool> {
     let now = Timestamp::now().as_microsecond();
     let tx = conn.transaction()?;
@@ -639,14 +639,21 @@ pub fn claim_scheduler_session(
              WHERE st.workspace_id = ?1 \
                AND st.project_id = ?2 \
                AND s.id = ?3 \
-               AND s.ended_at = ?5 \
-               AND s.ended_at > st.watermark_ended_at \
+               AND s.ended_at IS ?5 \
+               AND (s.ended_at IS NULL \
+                    OR s.ended_at > st.watermark_ended_at \
+                    OR EXISTS (SELECT 1 FROM auto_improve_session_cursor cur \
+                               WHERE cur.session_id = s.id)) \
          ) \
-           AND NOT EXISTS ( \
-               SELECT 1 FROM auto_improve_runs r \
-               WHERE r.workspace_id = ?1 \
-                 AND r.project_id = ?2 \
-                 AND r.session_id = ?3 \
+           AND ( \
+               EXISTS (SELECT 1 FROM auto_improve_session_cursor cur \
+                       WHERE cur.session_id = ?3) \
+               OR NOT EXISTS ( \
+                   SELECT 1 FROM auto_improve_runs r \
+                   WHERE r.workspace_id = ?1 \
+                     AND r.project_id = ?2 \
+                     AND r.session_id = ?3 \
+               ) \
            ) \
          ON CONFLICT(session_id) DO UPDATE SET \
              claimed_at = excluded.claimed_at, \
@@ -672,6 +679,66 @@ pub fn claim_scheduler_session(
     }
     tx.commit()?;
     Ok(inserted == 1)
+}
+
+/// Record a completed review of one session segment: advance the session's
+/// review cursor to `through` (monotonic: never backwards), count the segment,
+/// and delete the session's claim so the next segment can be claimed. All in one
+/// transaction, so a crash cannot leave a moved cursor with a live claim (which
+/// would block the next segment) or a released claim with an unmoved cursor
+/// (which would review the same observations again).
+///
+/// Returns the session's `segments_reviewed` after the update.
+///
+/// # Errors
+/// Returns an error when an underlying SQLite statement fails.
+pub fn complete_segment(
+    conn: &mut Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    session_id: SessionId,
+    through: crate::reader::ObservationPosition,
+) -> StoreResult<u32> {
+    let now = Timestamp::now().as_microsecond();
+    let tx = conn.transaction()?;
+    tx.execute(
+        "INSERT INTO auto_improve_session_cursor \
+         (session_id, last_observation_id, last_observation_created_at, \
+          last_reviewed_at, segments_reviewed) \
+         VALUES (?1, ?2, ?3, ?4, 1) \
+         ON CONFLICT(session_id) DO UPDATE SET \
+             last_observation_id = CASE \
+                 WHEN excluded.last_observation_created_at > last_observation_created_at \
+                   OR (excluded.last_observation_created_at = last_observation_created_at \
+                       AND excluded.last_observation_id > last_observation_id) \
+                 THEN excluded.last_observation_id ELSE last_observation_id END, \
+             last_observation_created_at = MAX(last_observation_created_at, \
+                                               excluded.last_observation_created_at), \
+             last_reviewed_at = excluded.last_reviewed_at, \
+             segments_reviewed = segments_reviewed + 1",
+        params![
+            session_id.as_bytes(),
+            through.id.as_bytes().to_vec(),
+            through.created_at,
+            now,
+        ],
+    )?;
+    tx.execute(
+        "DELETE FROM auto_improve_scheduler_claims \
+         WHERE workspace_id = ?1 AND project_id = ?2 AND session_id = ?3",
+        params![
+            workspace_id.as_bytes(),
+            project_id.as_bytes(),
+            session_id.as_bytes(),
+        ],
+    )?;
+    let segments: i64 = tx.query_row(
+        "SELECT segments_reviewed FROM auto_improve_session_cursor WHERE session_id = ?1",
+        params![session_id.as_bytes()],
+        |row| row.get(0),
+    )?;
+    tx.commit()?;
+    Ok(u32::try_from(segments).unwrap_or(u32::MAX))
 }
 
 /// Record that a scheduled review of `session_id` failed, releasing its claim

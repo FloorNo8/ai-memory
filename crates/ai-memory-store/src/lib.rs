@@ -64,14 +64,15 @@ pub use ops::{
 };
 pub use reader::{
     ActivityWindow, AgentSessionCount, AuditEvent, AuditLogFilter, AutoImproveCandidateCriteria,
-    AutoImproveCandidateSession, AutoImproveParkedClaim, BriefPageBody, BriefingPage,
-    BriefingSnapshot, ClientActivity, ContaminationFinding, ContaminationReport,
-    ContaminationSummary, ContradictionEdge, DecayCandidate, DecayTombstone, DerivedIndexStatus,
-    EmbeddingTripleCount, FeedbackFinding, GraphVia, HealthDetail, HealthPage, ObservationHit,
-    ObservationOrder, ObservationPage, ObservationPageResult, ObservationRecord, OpenSession,
-    PageAuthor, PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary,
+    AutoImproveCandidateQueue, AutoImproveCandidateSession, AutoImproveParkedClaim,
+    AutoImproveSessionCursor, BriefPageBody, BriefingPage, BriefingSnapshot, ClientActivity,
+    ContaminationFinding, ContaminationReport, ContaminationSummary, ContradictionEdge,
+    DecayCandidate, DecayTombstone, DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding,
+    GraphVia, HealthDetail, HealthPage, ObservationHit, ObservationOrder, ObservationPage,
+    ObservationPageResult, ObservationPosition, ObservationRecord, OpenSession, PageAuthor,
+    PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary,
     RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES, ReaderPool, ReindexTargetStatus, RelatedNode,
-    RelatedPage, RrfContributions, ScopeRow, SearchExplain, SessionDependentRows,
+    RelatedPage, RrfContributions, ScopeRow, SearchExplain, SegmentTrigger, SessionDependentRows,
     SessionEndDisposition, SessionSummary, SettledPage, StatusCounts, StorageStatus,
     StoredEmbedding, StoredPageBody, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
 };
@@ -4162,7 +4163,7 @@ mod tests {
             .unwrap();
         assert_eq!(remaining.len(), 1);
         assert_ne!(remaining[0].session_id, candidates[0].session_id);
-        assert_eq!(remaining[0].ended_at, same_ended_at);
+        assert_eq!(remaining[0].ended_at, Some(same_ended_at));
     }
 
     // #833: a claim is the scheduler's in-flight marker, but the only writer was

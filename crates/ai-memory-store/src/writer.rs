@@ -610,8 +610,15 @@ pub(crate) enum WriteCmd {
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         session_id: SessionId,
-        ended_at: i64,
+        ended_at: Option<i64>,
         reply: oneshot::Sender<StoreResult<bool>>,
+    },
+    CompleteAutoImproveSegment {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        through: crate::reader::ObservationPosition,
+        reply: oneshot::Sender<StoreResult<u32>>,
     },
     RecordAutoImproveClaimFailure {
         workspace_id: WorkspaceId,
@@ -2550,15 +2557,18 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
-    /// Atomically claim a completed session for scheduled auto-improvement
-    /// before any LLM work runs. Returns `false` if another scheduler/manual run
-    /// already claimed or reviewed the session.
+    /// Atomically claim a session segment for scheduled auto-improvement before
+    /// any LLM work runs. `ended_at` is the session's `ended_at` as selected
+    /// (`None` for an open session) and fences the claim: if the session ended,
+    /// resumed or re-ended since selection the claim is refused. Returns
+    /// `false` if another scheduler/manual run already claimed or reviewed the
+    /// segment.
     pub async fn claim_auto_improve_scheduler_session(
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
         session_id: SessionId,
-        ended_at: i64,
+        ended_at: Option<i64>,
     ) -> StoreResult<bool> {
         let (tx, rx) = oneshot::channel();
         self.send(WriteCmd::ClaimAutoImproveSchedulerSession {
@@ -2591,6 +2601,35 @@ impl WriterHandle {
             project_id,
             session_id,
             error: error.to_owned(),
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
+    /// Record a completed scheduled review of one session segment: move the
+    /// session's review cursor to `through` (never backwards), count the
+    /// segment, and release the session's claim so a later segment can be
+    /// claimed (FN8-10125, F2). Returns the session's `segments_reviewed`.
+    ///
+    /// A failed review must NOT call this: the cursor then stays where it was
+    /// and the segment is retried under the claim attempt limits.
+    ///
+    /// # Errors
+    /// Returns an error when the writer is closed or a statement fails.
+    pub async fn complete_auto_improve_segment(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        session_id: SessionId,
+        through: crate::reader::ObservationPosition,
+    ) -> StoreResult<u32> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::CompleteAutoImproveSegment {
+            workspace_id,
+            project_id,
+            session_id,
+            through,
             reply: tx,
         })
         .await?;
@@ -3680,6 +3719,22 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     ended_at,
                 );
                 send_or_warn(reply, result, "claim_auto_improve_scheduler_session");
+            }
+            WriteCmd::CompleteAutoImproveSegment {
+                workspace_id,
+                project_id,
+                session_id,
+                through,
+                reply,
+            } => {
+                let result = crate::auto_improve::complete_segment(
+                    &mut conn,
+                    workspace_id,
+                    project_id,
+                    session_id,
+                    through,
+                );
+                send_or_warn(reply, result, "complete_auto_improve_segment");
             }
             WriteCmd::RecordAutoImproveClaimFailure {
                 workspace_id,

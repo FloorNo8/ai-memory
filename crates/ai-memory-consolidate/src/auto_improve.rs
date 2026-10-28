@@ -15,7 +15,9 @@ use ai_memory_core::{Observation, PagePath, ProjectId, SessionId, WorkspaceId};
 use ai_memory_llm::{
     ChatMessage, ChatRequest, LlmError, LlmProvider, Role, complete_structured_with_operation_id,
 };
-use ai_memory_store::{AutoImproveRejectionSummary, BriefingPage, ReaderPool, StoredPageBody};
+use ai_memory_store::{
+    AutoImproveRejectionSummary, BriefingPage, ObservationPosition, ReaderPool, StoredPageBody,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de};
 use sha2::{Digest, Sha256};
@@ -440,6 +442,46 @@ pub async fn run_auto_improve_review(
     session_id: SessionId,
     cfg: AutoImproveReviewConfig,
 ) -> AutoImproveResult<AutoImproveReport> {
+    run_auto_improve_review_segment(
+        reader,
+        llm,
+        workspace_id,
+        project_id,
+        session_id,
+        cfg,
+        ReviewSegment::default(),
+    )
+    .await
+}
+
+/// Which observations of a session one review reads (FN8-10125, F2).
+///
+/// The default is the whole session. The scheduler narrows it to the segment
+/// after the session's review cursor, so a long or still-open session is
+/// reviewed in pieces and the same observations are never sent to the model
+/// twice.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReviewSegment {
+    /// Read strictly after this observation. `None` starts at the beginning.
+    pub after: Option<ObservationPosition>,
+    /// Read up to and including this observation. `None` reads to the end.
+    pub through: Option<ObservationPosition>,
+}
+
+/// [`run_auto_improve_review`] over one segment of the session.
+///
+/// # Errors
+/// Returns store, scope, or LLM errors. This function never writes wiki files or
+/// SQLite rows.
+pub async fn run_auto_improve_review_segment(
+    reader: &ReaderPool,
+    llm: &(dyn LlmProvider + 'static),
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    session_id: SessionId,
+    cfg: AutoImproveReviewConfig,
+    segment: ReviewSegment,
+) -> AutoImproveResult<AutoImproveReport> {
     match reader.session_project_ids(session_id).await? {
         Some((session_ws, session_proj))
             if session_ws == workspace_id && session_proj == project_id => {}
@@ -447,7 +489,9 @@ pub async fn run_auto_improve_review(
         None => return Err(AutoImproveError::SessionNotFound(session_id)),
     }
 
-    let observations = reader.observations_for_session(session_id).await?;
+    let observations = reader
+        .observations_for_session_range(session_id, segment.after, segment.through)
+        .await?;
     let duration = session_duration_secs(&observations);
     if let Some(rejection) = preflight_rejection(&observations, duration, &cfg) {
         return Ok(AutoImproveReport {

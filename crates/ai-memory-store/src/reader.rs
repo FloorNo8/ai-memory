@@ -695,30 +695,42 @@ pub struct PageHit {
     pub pinned: bool,
 }
 
-/// What a session must look like before the scheduler spends a slot on it.
+/// What a session segment must look like before the scheduler spends a slot on
+/// it, and when an unfinished session becomes reviewable.
 ///
-/// These are the cheap preflight checks the reviewer used to run only after the
-/// claim (FN8-10125, F1). Evaluating them while selecting candidates means a
-/// session that fails them never consumes a scheduler slot or leaves a claim or
-/// run row behind.
+/// The preflight fields are the cheap checks the reviewer used to run only
+/// after the claim (FN8-10125, F1). Evaluating them while selecting candidates
+/// means a session that fails them never consumes a scheduler slot or leaves a
+/// claim or run row behind. The trigger fields (F2) decide when an OPEN session
+/// is reviewable; a session that has ended is always reviewable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AutoImproveCandidateCriteria {
     /// Minimum age after `ended_at` before a completed session is eligible.
     pub min_session_age_secs: u64,
-    /// Minimum observation count (`[auto_improve] min_observations`). `0` disables.
+    /// Minimum observation count after the review cursor
+    /// (`[auto_improve] min_observations`). `0` disables.
     pub min_observations: usize,
-    /// Minimum first-to-last observation span
+    /// Minimum first-to-last observation span after the cursor
     /// (`[auto_improve] min_session_duration_secs`). `0` disables.
     pub min_session_duration_secs: u64,
-    /// Reject a session whose observations are all lifecycle boundaries (start,
+    /// Reject a segment whose observations are all lifecycle boundaries (start,
     /// stop, end, notification): no `user-prompt`, `pre-tool-use` or
     /// `post-tool-use`. Mirrors the hook router's `is_ephemeral_session`.
     pub require_substantive: bool,
+    /// An open session is reviewable once it has had no new observation for
+    /// this many seconds. `None` disables the trigger.
+    pub idle_secs: Option<u64>,
+    /// An open session is reviewable once this many observations sit after the
+    /// cursor, however recent. `None` disables the backstop.
+    pub max_segment_observations: Option<usize>,
+    /// An open session is reviewable once a compaction observation
+    /// (`pre-compact`, `post-compaction`) sits after the cursor.
+    pub compaction_trigger: bool,
 }
 
 impl AutoImproveCandidateCriteria {
-    /// Age cutoff only, with no content preflight. This is the pre-F1 behavior;
-    /// the scheduler does not use it.
+    /// Age cutoff only: completed sessions, no content preflight, no open-session
+    /// triggers. This is the pre-F1 behavior; the scheduler does not use it.
     #[must_use]
     pub const fn unfiltered(min_session_age_secs: u64) -> Self {
         Self {
@@ -726,17 +738,97 @@ impl AutoImproveCandidateCriteria {
             min_observations: 0,
             min_session_duration_secs: 0,
             require_substantive: false,
+            idle_secs: None,
+            max_segment_observations: None,
+            compaction_trigger: false,
+        }
+    }
+
+    const fn reviews_open_sessions(&self) -> bool {
+        self.idle_secs.is_some()
+            || self.max_segment_observations.is_some()
+            || self.compaction_trigger
+    }
+}
+
+/// A point in a session's observation stream: observations order by
+/// `(created_at, id)`, so the cursor stores both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservationPosition {
+    /// `created_at` of the observation, Unix microseconds.
+    pub created_at: i64,
+    /// The observation id.
+    pub id: ObservationId,
+}
+
+/// Why a session segment became eligible for review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentTrigger {
+    /// The session ended.
+    Ended,
+    /// No new observation for `idle_secs`.
+    Idle,
+    /// A compaction observation after the cursor.
+    Compaction,
+    /// `max_segment_observations` new observations.
+    Backstop,
+}
+
+impl SegmentTrigger {
+    /// Stable lowercase name for logs and run metadata.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ended => "ended",
+            Self::Idle => "idle",
+            Self::Compaction => "compaction",
+            Self::Backstop => "backstop",
         }
     }
 }
 
-/// Completed session selected for scheduled auto-improvement.
+/// A session segment selected for scheduled auto-improvement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AutoImproveCandidateSession {
     /// Session id.
     pub session_id: SessionId,
-    /// Session `ended_at` timestamp in Unix microseconds.
-    pub ended_at: i64,
+    /// Session `ended_at` timestamp in Unix microseconds; `None` for a session
+    /// that is still open.
+    pub ended_at: Option<i64>,
+    /// When the segment became eligible (Unix microseconds): `ended_at` for an
+    /// ended session, `last observation + idle_secs` for an idle one.
+    pub eligible_at: i64,
+    /// What made the segment eligible.
+    pub trigger: SegmentTrigger,
+    /// Observations after the cursor at selection time.
+    pub new_observations: usize,
+    /// The session's review cursor: the reviewer reads strictly after it.
+    pub after: Option<ObservationPosition>,
+    /// The last observation at selection time: the reviewer reads up to and
+    /// including it, and a completed review moves the cursor here. `None` only
+    /// for a completed session with no observations at all, which the content
+    /// preflight never selects.
+    pub through: Option<ObservationPosition>,
+}
+
+/// The scheduler queue for one scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoImproveCandidateQueue {
+    /// Every eligible segment in the scope, including those beyond `sessions`.
+    pub total: usize,
+    /// The oldest-eligible segments, at most the requested limit.
+    pub sessions: Vec<AutoImproveCandidateSession>,
+}
+
+/// A session's review cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoImproveSessionCursor {
+    /// The last observation the reviewer received.
+    pub position: ObservationPosition,
+    /// Wall clock of the last completed review, Unix microseconds.
+    pub last_reviewed_at: i64,
+    /// Completed reviews of this session.
+    pub segments_reviewed: u32,
 }
 
 /// A scheduler claim that has spent every review attempt (#833).
@@ -3492,25 +3584,8 @@ impl ReaderPool {
         .await
     }
 
-    /// Return sessions eligible for scheduled auto-improvement.
-    ///
-    /// The scheduler uses a persisted first-run watermark so an upgrade with an
-    /// LLM provider configured does not chew through historical backlog by
-    /// default (a one-time, horizon-bounded backfill lowers it, see
-    /// [`crate::auto_improve::apply_backfill`]). The scheduler inserts a
-    /// per-session claim before the LLM call, so failed scheduled reviews do not
-    /// retry forever or starve newer sessions. Any existing auto-improvement run
-    /// row for a session also counts as a scheduler review for candidate
-    /// selection; manual reruns remain available through CLI/admin/MCP.
-    ///
-    /// The cheap preflight lives here, not after the claim (FN8-10125, F1): a
-    /// session is a candidate only when it holds at least
-    /// `criteria.min_observations` observations, spans at least
-    /// `criteria.min_session_duration_secs`, and (when
-    /// `criteria.require_substantive`) is not boundary-only. A session that
-    /// fails any of these gets no claim and no run row, so it neither spends a
-    /// scheduler slot nor leaves a trace, and it becomes a candidate again the
-    /// moment enough new observations arrive.
+    /// Return session segments eligible for scheduled auto-improvement, oldest
+    /// eligible first. See [`Self::auto_improve_candidate_queue`].
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -3521,12 +3596,50 @@ impl ReaderPool {
         criteria: AutoImproveCandidateCriteria,
         limit: usize,
     ) -> StoreResult<Vec<AutoImproveCandidateSession>> {
-        let cutoff = Timestamp::now().as_microsecond().saturating_sub(
-            (criteria
-                .min_session_age_secs
-                .min(i64::MAX as u64 / 1_000_000) as i64)
-                * 1_000_000,
-        );
+        Ok(self
+            .auto_improve_candidate_queue(workspace_id, project_id, criteria, limit)
+            .await?
+            .sessions)
+    }
+
+    /// The scheduler queue for one scope: the oldest `limit` eligible segments
+    /// and the total number eligible.
+    ///
+    /// The scheduler uses a persisted first-run watermark so an upgrade with an
+    /// LLM provider configured does not chew through historical backlog by
+    /// default (a one-time, horizon-bounded backfill lowers it, see
+    /// [`crate::auto_improve::apply_backfill`]). The scheduler inserts a
+    /// per-session claim before the LLM call, so failed scheduled reviews do not
+    /// retry forever or starve newer sessions. A session with a run row and no
+    /// review cursor counts as reviewed; manual reruns remain available through
+    /// CLI/admin/MCP.
+    ///
+    /// The cheap preflight lives here, not after the claim (F1): a segment is
+    /// eligible only when it holds at least `criteria.min_observations`
+    /// observations after the session's review cursor (or since the start when
+    /// there is none), spans at least `criteria.min_session_duration_secs`, and
+    /// (when `criteria.require_substantive`) is not boundary-only. A segment that
+    /// fails any of these gets no claim and no run row, so it neither spends a
+    /// scheduler slot nor leaves a trace, and it becomes eligible again the
+    /// moment enough new observations arrive.
+    ///
+    /// A segment is eligible at the first of (F2): the session ended; no new
+    /// observation for `criteria.idle_secs`; a compaction observation after the
+    /// cursor; `criteria.max_segment_observations` new observations. A session
+    /// that has ended is reviewed whatever its trigger.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn auto_improve_candidate_queue(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        criteria: AutoImproveCandidateCriteria,
+        limit: usize,
+    ) -> StoreResult<AutoImproveCandidateQueue> {
+        let now = Timestamp::now().as_microsecond();
+        let secs_us = |secs: u64| secs.min(i64::MAX as u64 / 1_000_000) as i64 * 1_000_000;
+        let cutoff = now.saturating_sub(secs_us(criteria.min_session_age_secs));
         self.with_conn(move |conn| {
             let watermark: Option<i64> = conn
                 .query_row(
@@ -3537,16 +3650,29 @@ impl ReaderPool {
                 )
                 .optional()?;
             let Some(watermark) = watermark else {
-                return Ok(Vec::new());
+                return Ok(AutoImproveCandidateQueue {
+                    total: 0,
+                    sessions: Vec::new(),
+                });
             };
 
+            // Cheap per-session filters only; the observation-shape checks run
+            // per session below because they depend on the cursor.
             let mut stmt = conn.prepare_cached(
-                "SELECT s.id, s.ended_at, s.started_at FROM sessions s \
+                "SELECT s.id, s.ended_at, s.started_at, \
+                        cur.last_observation_id, cur.last_observation_created_at \
+                 FROM sessions s \
+                 LEFT JOIN auto_improve_session_cursor cur ON cur.session_id = s.id \
                  WHERE s.workspace_id = ?1 \
                    AND s.project_id = ?2 \
-                   AND s.ended_at IS NOT NULL \
-                   AND s.ended_at > ?3 \
-                   AND s.ended_at <= ?4 \
+                   AND ( \
+                        (s.ended_at IS NULL AND ?6 = 1) \
+                        OR ( \
+                            s.ended_at IS NOT NULL \
+                            AND (s.ended_at > ?3 OR cur.session_id IS NOT NULL) \
+                            AND s.ended_at <= ?4 \
+                        ) \
+                   ) \
                    AND NOT EXISTS ( \
                        SELECT 1 FROM auto_improve_scheduler_claims c \
                        WHERE c.workspace_id = s.workspace_id \
@@ -3557,13 +3683,15 @@ impl ReaderPool {
                              AND c.attempts < ?5 \
                          ) \
                    ) \
-                   AND NOT EXISTS ( \
-                       SELECT 1 FROM auto_improve_runs r \
-                       WHERE r.workspace_id = s.workspace_id \
-                         AND r.project_id = s.project_id \
-                         AND r.session_id = s.id \
-                   ) \
-                 ORDER BY s.ended_at ASC, s.started_at ASC",
+                   AND ( \
+                       cur.session_id IS NOT NULL \
+                       OR NOT EXISTS ( \
+                           SELECT 1 FROM auto_improve_runs r \
+                           WHERE r.workspace_id = s.workspace_id \
+                             AND r.project_id = s.project_id \
+                             AND r.session_id = s.id \
+                       ) \
+                   )",
             )?;
             let rows = stmt.query_map(
                 params![
@@ -3572,34 +3700,51 @@ impl ReaderPool {
                     watermark,
                     cutoff,
                     crate::auto_improve::AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS,
+                    i64::from(criteria.reviews_open_sessions()),
                 ],
                 |row| {
-                    let id_bytes: Vec<u8> = row.get(0)?;
-                    Ok((id_bytes, row.get::<_, i64>(1)?))
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
                 },
             )?;
             let mut shape = conn.prepare_cached(
                 "SELECT COUNT(*), \
                         COALESCE(SUM(kind IN ('user-prompt', 'pre-tool-use', 'post-tool-use')), 0), \
+                        COALESCE(SUM(kind IN ('pre-compact', 'post-compaction')), 0), \
                         COALESCE(MIN(created_at), 0), \
                         COALESCE(MAX(created_at), 0) \
-                 FROM observations WHERE session_id = ?1",
+                 FROM observations \
+                 WHERE session_id = ?1 \
+                   AND (?2 IS NULL OR created_at > ?2 \
+                        OR (created_at = ?2 AND id > ?3))",
             )?;
-            let min_duration_us = criteria
-                .min_session_duration_secs
-                .min(i64::MAX as u64 / 1_000_000) as i64
-                * 1_000_000;
-            let mut out = Vec::new();
+            let mut last = conn.prepare_cached(
+                "SELECT id, created_at FROM observations WHERE session_id = ?1 \
+                 ORDER BY created_at DESC, id DESC LIMIT 1",
+            )?;
+            let min_duration_us = secs_us(criteria.min_session_duration_secs);
+            let idle_us = criteria.idle_secs.map(secs_us);
+
+            let mut eligible = Vec::new();
             for row in rows {
-                if out.len() >= limit {
-                    break;
-                }
-                let (id_bytes, ended_at) = row?;
-                let (count, substantive, first_at, last_at): (i64, i64, i64, i64) = shape
-                    .query_row(params![id_bytes], |r| {
-                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                let (id_bytes, ended_at, started_at, cursor_id, cursor_at) = row?;
+                let (count, substantive, compactions, first_at, last_at): (i64, i64, i64, i64, i64) =
+                    shape.query_row(params![id_bytes, cursor_at, cursor_id], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                     })?;
-                if usize::try_from(count).unwrap_or(0) < criteria.min_observations {
+                let count = usize::try_from(count).unwrap_or(0);
+                // Nothing after the cursor (or an open session with nothing at
+                // all) is never a segment. A completed session with no
+                // observations is only reachable with the content preflight
+                // switched off (`unfiltered`).
+                if (count == 0 && (cursor_id.is_some() || ended_at.is_none()))
+                    || count < criteria.min_observations
+                {
                     continue;
                 }
                 if criteria.require_substantive && substantive == 0 {
@@ -3608,10 +3753,145 @@ impl ReaderPool {
                 if last_at.saturating_sub(first_at) < min_duration_us {
                     continue;
                 }
-                out.push(AutoImproveCandidateSession {
+                let (trigger, eligible_at) = if let Some(ended) = ended_at {
+                    (SegmentTrigger::Ended, ended)
+                } else {
+                    // Open session: history under the watermark stays excluded
+                    // unless it already has a cursor.
+                    if cursor_id.is_none() && last_at <= watermark {
+                        continue;
+                    }
+                    if let Some(idle) = idle_us.filter(|idle| now.saturating_sub(last_at) >= *idle)
+                    {
+                        (SegmentTrigger::Idle, last_at.saturating_add(idle))
+                    } else if criteria.compaction_trigger && compactions > 0 {
+                        (SegmentTrigger::Compaction, last_at)
+                    } else if criteria
+                        .max_segment_observations
+                        .is_some_and(|max| count >= max)
+                    {
+                        (SegmentTrigger::Backstop, last_at)
+                    } else {
+                        continue;
+                    }
+                };
+                eligible.push((eligible_at, started_at, id_bytes, ended_at, trigger, count, cursor_id, cursor_at));
+            }
+            eligible.sort_by_key(|e| (e.0, e.1));
+            let total = eligible.len();
+
+            let mut sessions = Vec::new();
+            for (eligible_at, _, id_bytes, ended_at, trigger, count, cursor_id, cursor_at) in
+                eligible.into_iter().take(limit)
+            {
+                let through = last
+                    .query_row(params![id_bytes], |r| {
+                        Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))
+                    })
+                    .optional()?
+                    .map(|(id, created_at)| {
+                        ObservationId::from_slice(&id)
+                            .map(|id| ObservationPosition { created_at, id })
+                    })
+                    .transpose()?;
+                let after = match (cursor_id, cursor_at) {
+                    (Some(id), Some(created_at)) => Some(ObservationPosition {
+                        created_at,
+                        id: ObservationId::from_slice(&id)?,
+                    }),
+                    _ => None,
+                };
+                sessions.push(AutoImproveCandidateSession {
                     session_id: SessionId::from_slice(&id_bytes)?,
                     ended_at,
+                    eligible_at,
+                    trigger,
+                    new_observations: count,
+                    after,
+                    through,
                 });
+            }
+            Ok(AutoImproveCandidateQueue { total, sessions })
+        })
+        .await
+    }
+
+    /// The review cursor of `session_id`, or `None` when no review of it has
+    /// completed.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn auto_improve_session_cursor(
+        &self,
+        session_id: SessionId,
+    ) -> StoreResult<Option<AutoImproveSessionCursor>> {
+        self.with_conn(move |conn| {
+            let row = conn
+                .query_row(
+                    "SELECT last_observation_id, last_observation_created_at, \
+                            last_reviewed_at, segments_reviewed \
+                     FROM auto_improve_session_cursor WHERE session_id = ?1",
+                    params![session_id.as_bytes()],
+                    |r| {
+                        Ok((
+                            r.get::<_, Vec<u8>>(0)?,
+                            r.get::<_, i64>(1)?,
+                            r.get::<_, i64>(2)?,
+                            r.get::<_, i64>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            row.map(|(id, created_at, last_reviewed_at, segments)| {
+                Ok(AutoImproveSessionCursor {
+                    position: ObservationPosition {
+                        created_at,
+                        id: ObservationId::from_slice(&id)?,
+                    },
+                    last_reviewed_at,
+                    segments_reviewed: u32::try_from(segments).unwrap_or(u32::MAX),
+                })
+            })
+            .transpose()
+        })
+        .await
+    }
+
+    /// One session's observations strictly after `after` and up to and
+    /// including `through`, in `(created_at, id)` order. `None` leaves that end
+    /// open, so `(None, None)` is the whole session.
+    ///
+    /// # Errors
+    /// Propagates any SQL or pool error.
+    pub async fn observations_for_session_range(
+        &self,
+        session_id: SessionId,
+        after: Option<ObservationPosition>,
+        through: Option<ObservationPosition>,
+    ) -> StoreResult<Vec<Observation>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, session_id, workspace_id, project_id, kind, extension, source_event, \
+                        title, body, importance, created_at \
+                 FROM observations \
+                 WHERE session_id = ?1 \
+                   AND (?2 IS NULL OR created_at > ?2 OR (created_at = ?2 AND id > ?3)) \
+                   AND (?4 IS NULL OR created_at < ?4 OR (created_at = ?4 AND id <= ?5)) \
+                 ORDER BY created_at ASC, id ASC",
+            )?;
+            let rows = stmt.query_map(
+                params![
+                    session_id.as_bytes(),
+                    after.map(|p| p.created_at),
+                    after.map(|p| p.id.as_bytes().to_vec()),
+                    through.map(|p| p.created_at),
+                    through.map(|p| p.id.as_bytes().to_vec()),
+                ],
+                row_to_observation,
+            )?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r??);
             }
             Ok(out)
         })
