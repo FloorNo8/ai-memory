@@ -363,12 +363,47 @@ enabled = true                # false disables background review only
 interval_secs = 3600          # 0 disables background review only
 max_sessions_per_tick = 1       # per project; ticks process projects sequentially
 min_session_age_secs = 600
+backfill_days = 30            # one-time: review sessions that ended within N days before the first run
+idle_secs = 7200              # an OPEN session is reviewable after this long without a new observation
+max_segment_observations = 200  # ... or once this many observations sit after its review cursor
+burst_sessions_per_tick = 4   # global budget per tick while the queue is deeper than the per-project budget
 ```
 
 `[auto_improve.scheduler]` controls whether and how often the server launches
 background review. `[auto_improve] require_approval` controls whether validated
 proposals are applied automatically or left pending. They intentionally do not
 imply each other.
+
+### Candidate selection and segment review
+
+The cheap preflight (`min_observations`, `min_session_duration_secs`, and
+"not boundary-only": at least one `user-prompt`, `pre-tool-use` or
+`post-tool-use`) is part of candidate selection. A session that fails it gets no
+claim and no `auto_improve_runs` row, so it never spends a scheduler slot, and it
+becomes a candidate again as soon as enough new observations arrive.
+
+A session is reviewed in **segments**. `auto_improve_session_cursor` records the
+last observation a completed review received; the reviewer is given only the
+observations after it, and a completed review moves the cursor and increments
+`segments_reviewed`. A failed review leaves the cursor, so the same segment is
+retried under the claim attempt limit (3). A segment is eligible at the first of:
+
+1. the session ended;
+2. no new observation for `idle_secs` (open sessions);
+3. a compaction observation (`pre-compact`, `post-compaction`);
+4. `max_segment_observations` new observations.
+
+`backfill_days` lowers each project's watermark to `now - backfill_days` exactly
+once (`auto_improve_scheduler_state.backfill_applied_at`), so recent sessions
+that ended before the first run are reviewed once; sessions already reviewed or
+claimed are never re-queued.
+
+Budget: normally `max_sessions_per_tick` per project per tick. While the total
+eligible queue (backlog plus segments) is larger than that budget can drain, the
+tick reviews up to `burst_sessions_per_tick` segments across all projects,
+oldest eligible first, and falls back to the per-project rule by itself once the
+queue fits it. Ticks stay non-overlapping. The tick log reports `queue_len` and
+`burst`.
 
 `max_rejection_context` and `rejection_context_days` bound the persistent
 rejection-buffer summary included in future reviewer prompts. The buffer is

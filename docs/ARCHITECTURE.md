@@ -719,6 +719,10 @@ enabled = true
 interval_secs = 3600
 max_sessions_per_tick = 1        # per project; scheduler ticks do not overlap
 min_session_age_secs = 600
+backfill_days = 30               # one-time review of recent pre-watermark sessions
+idle_secs = 7200                 # open session reviewable after this long idle
+max_segment_observations = 200   # ... or after this many new observations
+burst_sessions_per_tick = 4      # global budget while the queue is deep
 experience_every_sessions = 0    # 0 disables the cross-session experience pass
 experience_sessions = 10         # session summaries one experience pass reads
 
