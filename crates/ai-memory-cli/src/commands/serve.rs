@@ -1938,6 +1938,10 @@ async fn start_maintenance_scheduler(
             require_approval: auto_improve.require_approval,
             min_session_age_secs: scheduler.min_session_age_secs,
             max_sessions_per_tick: scheduler.max_sessions_per_tick,
+            backfill_days: scheduler.backfill_days,
+            idle_secs: scheduler.idle_secs,
+            max_segment_observations: scheduler.max_segment_observations,
+            burst_sessions_per_tick: scheduler.burst_sessions_per_tick,
             experience: (scheduler.experience_every_sessions > 0).then(|| {
                 ai_memory_consolidate::ExperienceConfig {
                     sessions: scheduler.experience_sessions.max(1),
@@ -1980,6 +1984,8 @@ async fn start_maintenance_scheduler(
                     Ok(outcome) => info!(
                         scopes = outcome.scopes,
                         scopes_with_candidates = outcome.scopes_with_candidates,
+                        queue_len = outcome.queue_len,
+                        burst = outcome.burst,
                         reviewed = outcome.reviewed,
                         skipped = outcome.skipped,
                         errors = outcome.errors,

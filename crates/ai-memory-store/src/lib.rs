@@ -63,17 +63,18 @@ pub use ops::{
     backfill_page_windows, backfill_page_windows_in_batches, purge_session, record_embed_failure,
 };
 pub use reader::{
-    ActivityWindow, AgentSessionCount, AuditEvent, AuditLogFilter, AutoImproveCandidateSession,
-    AutoImproveParkedClaim, BriefPageBody, BriefingPage, BriefingSnapshot, ClientActivity,
+    ActivityWindow, AgentSessionCount, AuditEvent, AuditLogFilter, AutoImproveCandidateCriteria,
+    AutoImproveCandidateQueue, AutoImproveCandidateSession, AutoImproveParkedClaim,
+    AutoImproveSessionCursor, BriefPageBody, BriefingPage, BriefingSnapshot, ClientActivity,
     ContaminationFinding, ContaminationReport, ContaminationSummary, ContradictionEdge,
     DecayCandidate, DecayTombstone, DerivedIndexStatus, EmbeddingTripleCount, FeedbackFinding,
     GraphVia, HealthDetail, HealthPage, ObservationHit, ObservationOrder, ObservationPage,
-    ObservationPageResult, ObservationRecord, OpenSession, PageAuthor, PageHit, PageHitWithMeta,
-    PageLinks, PageMeta, PageSummary, ProjectSummary, RELATED_WALK_MAX_DEPTH,
-    RELATED_WALK_MAX_NODES, ReaderPool, ReindexTargetStatus, RelatedNode, RelatedPage,
-    RrfContributions, ScopeRow, SearchExplain, SessionDependentRows, SessionEndDisposition,
-    SessionSummary, SettledPage, StatusCounts, StorageStatus, StoredEmbedding, StoredPageBody,
-    WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
+    ObservationPageResult, ObservationPosition, ObservationRecord, OpenSession, PageAuthor,
+    PageHit, PageHitWithMeta, PageLinks, PageMeta, PageSummary, ProjectSummary,
+    RELATED_WALK_MAX_DEPTH, RELATED_WALK_MAX_NODES, ReaderPool, ReindexTargetStatus, RelatedNode,
+    RelatedPage, RrfContributions, ScopeRow, SearchExplain, SegmentTrigger, SessionDependentRows,
+    SessionEndDisposition, SessionSummary, SettledPage, StatusCounts, StorageStatus,
+    StoredEmbedding, StoredPageBody, WorkspaceScopeRow, WorkspaceSummary, f32_vec_to_bytes,
 };
 pub use retrieval_tuning::{RetrievalTuning, is_session_recall_query};
 pub use scope::{
@@ -1745,7 +1746,12 @@ mod tests {
             .unwrap();
         let candidate = store
             .reader
-            .auto_improve_candidate_sessions(src_ws, proj, 0, 1)
+            .auto_improve_candidate_sessions(
+                src_ws,
+                proj,
+                AutoImproveCandidateCriteria::unfiltered(0),
+                1,
+            )
             .await
             .unwrap()
             .pop()
@@ -1804,7 +1810,12 @@ mod tests {
         assert!(
             store
                 .reader
-                .auto_improve_candidate_sessions(dst_ws, proj, 0, 10)
+                .auto_improve_candidate_sessions(
+                    dst_ws,
+                    proj,
+                    AutoImproveCandidateCriteria::unfiltered(0),
+                    10
+                )
                 .await
                 .unwrap()
                 .is_empty(),
@@ -3813,7 +3824,12 @@ mod tests {
         assert!(
             store
                 .reader
-                .auto_improve_candidate_sessions(ws, proj, 86_400, 10)
+                .auto_improve_candidate_sessions(
+                    ws,
+                    proj,
+                    AutoImproveCandidateCriteria::unfiltered(86_400),
+                    10
+                )
                 .await
                 .unwrap()
                 .is_empty(),
@@ -3822,7 +3838,12 @@ mod tests {
 
         let candidates = store
             .reader
-            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .auto_improve_candidate_sessions(
+                ws,
+                proj,
+                AutoImproveCandidateCriteria::unfiltered(0),
+                10,
+            )
             .await
             .unwrap();
         assert_eq!(candidates.len(), 1);
@@ -3857,7 +3878,12 @@ mod tests {
         assert!(
             store
                 .reader
-                .auto_improve_candidate_sessions(ws, proj, 0, 10)
+                .auto_improve_candidate_sessions(
+                    ws,
+                    proj,
+                    AutoImproveCandidateCriteria::unfiltered(0),
+                    10
+                )
                 .await
                 .unwrap()
                 .is_empty(),
@@ -3909,7 +3935,12 @@ mod tests {
         assert!(
             store
                 .reader
-                .auto_improve_candidate_sessions(ws, proj, 0, 10)
+                .auto_improve_candidate_sessions(
+                    ws,
+                    proj,
+                    AutoImproveCandidateCriteria::unfiltered(0),
+                    10
+                )
                 .await
                 .unwrap()
                 .is_empty(),
@@ -3990,7 +4021,12 @@ mod tests {
         for (project_id, session_id) in expected {
             let candidates = store
                 .reader
-                .auto_improve_candidate_sessions(ws, project_id, 0, 10)
+                .auto_improve_candidate_sessions(
+                    ws,
+                    project_id,
+                    AutoImproveCandidateCriteria::unfiltered(0),
+                    10,
+                )
                 .await
                 .unwrap();
             assert_eq!(candidates.len(), 1);
@@ -4031,7 +4067,12 @@ mod tests {
 
         let candidates = store
             .reader
-            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .auto_improve_candidate_sessions(
+                ws,
+                proj,
+                AutoImproveCandidateCriteria::unfiltered(0),
+                10,
+            )
             .await
             .unwrap();
         assert_eq!(candidates.len(), 1);
@@ -4088,7 +4129,12 @@ mod tests {
 
         let candidates = store
             .reader
-            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .auto_improve_candidate_sessions(
+                ws,
+                proj,
+                AutoImproveCandidateCriteria::unfiltered(0),
+                10,
+            )
             .await
             .unwrap();
         assert_eq!(candidates.len(), 2);
@@ -4107,12 +4153,17 @@ mod tests {
 
         let remaining = store
             .reader
-            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .auto_improve_candidate_sessions(
+                ws,
+                proj,
+                AutoImproveCandidateCriteria::unfiltered(0),
+                10,
+            )
             .await
             .unwrap();
         assert_eq!(remaining.len(), 1);
         assert_ne!(remaining[0].session_id, candidates[0].session_id);
-        assert_eq!(remaining[0].ended_at, same_ended_at);
+        assert_eq!(remaining[0].ended_at, Some(same_ended_at));
     }
 
     // #833: a claim is the scheduler's in-flight marker, but the only writer was
@@ -4159,7 +4210,12 @@ mod tests {
 
         let candidates = store
             .reader
-            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .auto_improve_candidate_sessions(
+                ws,
+                proj,
+                AutoImproveCandidateCriteria::unfiltered(0),
+                10,
+            )
             .await
             .unwrap();
         assert_eq!(candidates.len(), 1);
@@ -4168,7 +4224,12 @@ mod tests {
         for attempt in 1..AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS {
             let candidates = store
                 .reader
-                .auto_improve_candidate_sessions(ws, proj, 0, 10)
+                .auto_improve_candidate_sessions(
+                    ws,
+                    proj,
+                    AutoImproveCandidateCriteria::unfiltered(0),
+                    10,
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -4192,7 +4253,12 @@ mod tests {
             assert!(
                 store
                     .reader
-                    .auto_improve_candidate_sessions(ws, proj, 0, 10)
+                    .auto_improve_candidate_sessions(
+                        ws,
+                        proj,
+                        AutoImproveCandidateCriteria::unfiltered(0),
+                        10
+                    )
                     .await
                     .unwrap()
                     .is_empty(),
@@ -4214,7 +4280,12 @@ mod tests {
         // The final failure parks the session instead of looping forever.
         let candidates = store
             .reader
-            .auto_improve_candidate_sessions(ws, proj, 0, 10)
+            .auto_improve_candidate_sessions(
+                ws,
+                proj,
+                AutoImproveCandidateCriteria::unfiltered(0),
+                10,
+            )
             .await
             .unwrap();
         assert_eq!(candidates.len(), 1);
@@ -4237,7 +4308,12 @@ mod tests {
         assert!(
             store
                 .reader
-                .auto_improve_candidate_sessions(ws, proj, 0, 10)
+                .auto_improve_candidate_sessions(
+                    ws,
+                    proj,
+                    AutoImproveCandidateCriteria::unfiltered(0),
+                    10
+                )
                 .await
                 .unwrap()
                 .is_empty(),
@@ -4297,7 +4373,12 @@ mod tests {
         store.writer.end_session(session_id, None).await.unwrap();
         let ended_at = store
             .reader
-            .auto_improve_candidate_sessions(ws, proj, 0, 1)
+            .auto_improve_candidate_sessions(
+                ws,
+                proj,
+                AutoImproveCandidateCriteria::unfiltered(0),
+                1,
+            )
             .await
             .unwrap()[0]
             .ended_at;
@@ -4432,7 +4513,12 @@ mod tests {
         assert!(
             store
                 .reader
-                .auto_improve_candidate_sessions(ws, proj, 0, 10)
+                .auto_improve_candidate_sessions(
+                    ws,
+                    proj,
+                    AutoImproveCandidateCriteria::unfiltered(0),
+                    10
+                )
                 .await
                 .unwrap()
                 .is_empty(),

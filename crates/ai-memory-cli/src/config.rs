@@ -1017,6 +1017,25 @@ pub struct AutoImproveSchedulerSettings {
     pub max_sessions_per_tick: usize,
     /// Minimum age after SessionEnd before a session becomes eligible.
     pub min_session_age_secs: u64,
+    /// One-time backfill horizon in days (FN8-10125). Sessions that ended
+    /// inside this horizon but before the startup watermark become eligible
+    /// once per project; older history stays excluded. `0` disables the
+    /// backfill, restoring "never review history on upgrade".
+    pub backfill_days: u64,
+    /// An OPEN session becomes reviewable after this many seconds without a new
+    /// observation, so a session that never ends (or is abandoned) is still
+    /// reviewed in segments (FN8-10125). `0` disables the idle trigger.
+    pub idle_secs: u64,
+    /// An open session becomes reviewable once this many observations sit after
+    /// its review cursor, however recent. A compaction observation
+    /// (`pre-compact`, `post-compaction`) is always a trigger as well. `0`
+    /// disables the backstop.
+    pub max_segment_observations: usize,
+    /// While the eligible queue (backlog plus segments) is deeper than the
+    /// per-project budget can drain in one tick, review up to this many
+    /// segments per tick across ALL projects; otherwise the per-project
+    /// `max_sessions_per_tick` applies. `0` disables the burst.
+    pub burst_sessions_per_tick: usize,
     /// Cross-session ("experience") pass: run after this many NEW
     /// completed sessions per project. `0` (default) disables the pass —
     /// it is opt-in and shaped by docs/experience.md.
@@ -1037,6 +1056,10 @@ impl Default for AutoImproveSchedulerSettings {
             interval_secs: 3_600,
             max_sessions_per_tick: 1,
             min_session_age_secs: 600,
+            backfill_days: 30,
+            idle_secs: 7_200,
+            max_segment_observations: 200,
+            burst_sessions_per_tick: 4,
             experience_every_sessions: 0,
             experience_sessions: 10,
             experience_entropy_filter: ai_memory_consolidate::EntropyFilterConfig::default(),
@@ -2462,6 +2485,10 @@ mod tests {
         assert_eq!(cfg.auto_improve.scheduler.interval_secs, 3_600);
         assert_eq!(cfg.auto_improve.scheduler.max_sessions_per_tick, 1);
         assert_eq!(cfg.auto_improve.scheduler.min_session_age_secs, 600);
+        assert_eq!(cfg.auto_improve.scheduler.backfill_days, 30);
+        assert_eq!(cfg.auto_improve.scheduler.idle_secs, 7_200);
+        assert_eq!(cfg.auto_improve.scheduler.max_segment_observations, 200);
+        assert_eq!(cfg.auto_improve.scheduler.burst_sessions_per_tick, 4);
         assert!(!cfg.auto_improve.on_session_end);
         assert!(!cfg.auto_improve.require_approval);
         assert_eq!(cfg.auto_improve.min_observations, 8);
@@ -2972,6 +2999,10 @@ mod tests {
             interval_secs = 1800
             max_sessions_per_tick = 4
             min_session_age_secs = 30
+            backfill_days = 7
+            idle_secs = 900
+            max_segment_observations = 50
+            burst_sessions_per_tick = 2
 
             [auto_improve.eval]
             enabled = true
@@ -2997,6 +3028,10 @@ mod tests {
         assert_eq!(cfg.auto_improve.scheduler.interval_secs, 1_800);
         assert_eq!(cfg.auto_improve.scheduler.max_sessions_per_tick, 4);
         assert_eq!(cfg.auto_improve.scheduler.min_session_age_secs, 30);
+        assert_eq!(cfg.auto_improve.scheduler.backfill_days, 7);
+        assert_eq!(cfg.auto_improve.scheduler.idle_secs, 900);
+        assert_eq!(cfg.auto_improve.scheduler.max_segment_observations, 50);
+        assert_eq!(cfg.auto_improve.scheduler.burst_sessions_per_tick, 2);
         assert!(cfg.auto_improve.on_session_end);
         assert!(cfg.auto_improve.require_approval);
         assert_eq!(cfg.auto_improve.min_observations, 3);

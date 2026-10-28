@@ -225,6 +225,28 @@ enabled = true
 interval_secs = 3600
 max_sessions_per_tick = 1 # per project
 min_session_age_secs = 600
+# One-time backfill: sessions that ended within this many days but BEFORE the
+# scheduler's startup watermark become eligible once per project, so recent
+# history is reviewed instead of silently skipped. Older history stays out.
+# Sessions already reviewed or claimed are never re-queued. 0 = never review
+# history that predates the scheduler's first run.
+backfill_days = 30
+# Segment review: a session is no longer reviewed once, at its end. It is
+# reviewed in SEGMENTS, each a slice of observations after the session's review
+# cursor, so long or never-ended sessions (AGY, OpenCode, Pool) are reviewed and
+# no observation is sent to the model twice. A segment becomes eligible at the
+# first of: the session ended; no new observation for `idle_secs`; a compaction
+# observation (pre-compact / post-compaction); `max_segment_observations` new
+# observations. A segment below `[auto_improve] min_observations`, or only
+# lifecycle boundaries (start/stop/end), is never claimed and stays eligible
+# when more arrive. 0 disables the idle trigger / the backstop.
+idle_secs = 7200
+max_segment_observations = 200
+# Burst: while the eligible queue is deeper than `max_sessions_per_tick` per
+# project can drain, review up to this many segments per tick ACROSS projects,
+# oldest first. When the queue shrinks to the per-project budget the scheduler
+# returns to `max_sessions_per_tick` per project by itself. 0 = never burst.
+burst_sessions_per_tick = 4
 
 # How a mid-session event is attributed when the agent's cwd has moved since
 # the session started. Session-CREATING events always resolve from their own

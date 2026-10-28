@@ -39,8 +39,8 @@ pub use auto_improve::{
     DEFAULT_AUTO_IMPROVE_MAX_RULE_PAGE_TOKENS, DEFAULT_AUTO_IMPROVE_MIN_CONFIDENCE,
     DEFAULT_AUTO_IMPROVE_MIN_OBSERVATIONS, DEFAULT_AUTO_IMPROVE_MIN_SESSION_DURATION_SECS,
     DEFAULT_AUTO_IMPROVE_PENDING_PATH, DEFAULT_AUTO_IMPROVE_PROPOSAL_ACTOR,
-    DEFAULT_AUTO_IMPROVE_REJECTION_CONTEXT_DAYS, default_auto_improve_eval_targets,
-    run_auto_improve_review,
+    DEFAULT_AUTO_IMPROVE_REJECTION_CONTEXT_DAYS, ReviewSegment, default_auto_improve_eval_targets,
+    run_auto_improve_review, run_auto_improve_review_segment,
 };
 pub use auto_improve_schedule::{
     ScheduledAutoImproveSettings, ScheduledAutoImproveTickOutcome,

@@ -6,6 +6,7 @@ mod access_breadth;
 mod agent_messages;
 mod audit_contamination;
 mod audit_log;
+mod auto_improve_candidates;
 mod auto_improve_staging;
 mod belief_authority;
 mod client_activity;

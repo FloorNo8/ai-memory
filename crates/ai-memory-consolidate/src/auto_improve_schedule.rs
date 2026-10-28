@@ -18,14 +18,17 @@ use std::sync::Arc;
 use ai_memory_core::{ActorContext, PagePath, ProjectId, SessionId, WorkspaceId};
 use ai_memory_llm::LlmProvider;
 use ai_memory_store::{
-    ApproveAutoImproveProposalResult, AutoImproveProposalOperation, NewAutoImproveProposal,
-    ReaderPool, SkippedProposal, StageAutoImproveRun, WriterHandle,
+    ApproveAutoImproveProposalResult, AutoImproveCandidateCriteria, AutoImproveCandidateSession,
+    AutoImproveProposalOperation, NewAutoImproveProposal, ReaderPool, SkippedProposal,
+    StageAutoImproveRun, WriterHandle,
 };
 use ai_memory_wiki::Wiki;
 use anyhow::Result;
 use tracing::info;
 
-use crate::{AutoImproveReport, AutoImproveReviewConfig, run_auto_improve_review};
+use crate::{
+    AutoImproveReport, AutoImproveReviewConfig, ReviewSegment, run_auto_improve_review_segment,
+};
 
 /// Settings for the scheduled auto-improvement loop, already mapped from
 /// the host's configuration. Bundles the review config with the
@@ -43,6 +46,22 @@ pub struct ScheduledAutoImproveSettings {
     /// Maximum sessions reviewed per scope per tick
     /// (`[auto_improve.scheduler] max_sessions_per_tick`).
     pub max_sessions_per_tick: usize,
+    /// One-time backfill horizon in days (`[auto_improve.scheduler]
+    /// backfill_days`). Sessions that ended inside the horizon but under the
+    /// startup watermark become eligible once per scope. `0` disables.
+    pub backfill_days: u64,
+    /// An OPEN session becomes reviewable after this many seconds without a new
+    /// observation (`[auto_improve.scheduler] idle_secs`). `0` disables.
+    pub idle_secs: u64,
+    /// An open session becomes reviewable once this many observations sit
+    /// after its review cursor (`[auto_improve.scheduler]
+    /// max_segment_observations`). `0` disables.
+    pub max_segment_observations: usize,
+    /// While the eligible queue (backlog plus segments) holds more than the
+    /// per-project budget can drain, review up to this many segments per tick
+    /// globally (`[auto_improve.scheduler] burst_sessions_per_tick`). `0`
+    /// disables the burst: the per-project budget always applies.
+    pub burst_sessions_per_tick: usize,
     /// Cross-session ("experience") pass settings; `None` = disabled
     /// (`[auto_improve.experience]`, docs/experience.md).
     pub experience: Option<crate::ExperienceConfig>,
@@ -79,6 +98,64 @@ pub async fn initialize_auto_improve_scheduler_scopes(
     Ok((total, errors))
 }
 
+/// The candidate filter for a tick. The cheap preflight the reviewer applies
+/// (observation floor, duration floor) moves here so a session that would be
+/// skipped never spends a scheduler slot (FN8-10125, F1).
+fn candidate_criteria(settings: &ScheduledAutoImproveSettings) -> AutoImproveCandidateCriteria {
+    AutoImproveCandidateCriteria {
+        min_session_age_secs: settings.min_session_age_secs,
+        min_observations: settings.review.min_observations,
+        min_session_duration_secs: settings.review.min_session_duration_secs,
+        require_substantive: true,
+        idle_secs: (settings.idle_secs > 0).then_some(settings.idle_secs),
+        max_segment_observations: (settings.max_segment_observations > 0)
+            .then_some(settings.max_segment_observations),
+        compaction_trigger: true,
+    }
+}
+
+/// How many segments one tick may review, and in which order.
+///
+/// `queue_len` is every eligible segment across all scopes. Normally each scope
+/// gets `max_sessions_per_tick` (one per project per interval). When the queue
+/// holds more than that can drain in a tick, the tick is in burst mode and
+/// reviews up to `burst_sessions_per_tick` segments globally, oldest eligible
+/// first. Once the queue shrinks to what the per-project budget covers, the
+/// tick falls back to the per-project rule on its own (FN8-10125, F2).
+fn select_for_tick(
+    settings: &ScheduledAutoImproveSettings,
+    mut queue: Vec<QueuedSegment>,
+    queue_len: usize,
+) -> (Vec<QueuedSegment>, bool) {
+    let mut scopes_with_work: Vec<ProjectId> = queue.iter().map(|q| q.project_id).collect();
+    scopes_with_work.sort_by_key(|p| *p.as_bytes());
+    scopes_with_work.dedup();
+    let per_project = settings.max_sessions_per_tick.max(1);
+    let burst = settings.burst_sessions_per_tick > 0
+        && queue_len > scopes_with_work.len().saturating_mul(per_project);
+    if burst {
+        queue.sort_by_key(|q| q.candidate.eligible_at);
+        queue.truncate(settings.burst_sessions_per_tick.max(per_project));
+        return (queue, true);
+    }
+    let mut taken: std::collections::HashMap<ProjectId, usize> = std::collections::HashMap::new();
+    queue.retain(|q| {
+        let n = taken.entry(q.project_id).or_insert(0);
+        *n += 1;
+        *n <= per_project
+    });
+    (queue, false)
+}
+
+/// One eligible segment together with the scope it belongs to.
+struct QueuedSegment {
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    workspace_name: String,
+    project_name: String,
+    candidate: AutoImproveCandidateSession,
+}
+
 struct ScheduledAutoImproveOutcome {
     run_id: ai_memory_core::AutoImproveRunId,
     proposals: usize,
@@ -113,6 +190,12 @@ pub struct ScheduledAutoImproveTickOutcome {
     pub parked: usize,
     /// Cross-session ("experience") passes that ran this tick.
     pub experience_runs: usize,
+    /// Eligible segments across every scope when the tick started (backlog plus
+    /// open-session segments). The queue-length metric (FN8-10125, F2).
+    pub queue_len: usize,
+    /// True when the queue exceeded the per-project budget and the tick used the
+    /// global burst budget instead.
+    pub burst: bool,
 }
 
 struct ScheduledAutoImproveContext<'a> {
@@ -144,6 +227,11 @@ pub async fn run_auto_improve_scheduler_tick(
         scopes: scopes.len(),
         ..ScheduledAutoImproveTickOutcome::default()
     };
+    // Fetch enough per scope to fill either budget.
+    let fetch = settings
+        .burst_sessions_per_tick
+        .max(settings.max_sessions_per_tick);
+    let mut queue: Vec<QueuedSegment> = Vec::new();
 
     for scope in scopes {
         if let Err(e) = writer
@@ -160,16 +248,45 @@ pub async fn run_auto_improve_scheduler_tick(
             continue;
         }
 
-        let candidates = match reader
-            .auto_improve_candidate_sessions(
+        if settings.backfill_days > 0 {
+            match writer
+                .apply_auto_improve_backfill(
+                    scope.workspace_id,
+                    scope.project_id,
+                    settings.backfill_days.saturating_mul(86_400),
+                )
+                .await
+            {
+                Ok(true) => info!(
+                    workspace = %scope.workspace_name,
+                    project = %scope.project_name,
+                    backfill_days = settings.backfill_days,
+                    "auto-improve one-time backfill applied"
+                ),
+                Ok(false) => {}
+                Err(e) => {
+                    outcome.errors += 1;
+                    tracing::warn!(
+                        workspace = %scope.workspace_name,
+                        project = %scope.project_name,
+                        error = %e,
+                        "scheduled auto-improve backfill failed"
+                    );
+                    continue;
+                }
+            }
+        }
+
+        let scope_queue = match reader
+            .auto_improve_candidate_queue(
                 scope.workspace_id,
                 scope.project_id,
-                settings.min_session_age_secs,
-                settings.max_sessions_per_tick,
+                candidate_criteria(settings),
+                fetch,
             )
             .await
         {
-            Ok(candidates) => candidates,
+            Ok(scope_queue) => scope_queue,
             Err(e) => {
                 outcome.errors += 1;
                 tracing::warn!(
@@ -181,218 +298,307 @@ pub async fn run_auto_improve_scheduler_tick(
                 continue;
             }
         };
+        outcome.queue_len += scope_queue.total;
+
+        // Cross-session ("experience") pass — cadence-gated per scope,
+        // independent of whether this tick has per-session candidates.
+        if let Some(experience) = &settings.experience {
+            let ctx = ScheduledAutoImproveContext {
+                reader,
+                writer,
+                wiki,
+                llm,
+                workspace_id: scope.workspace_id,
+                project_id: scope.project_id,
+                settings,
+            };
+            run_experience_if_due(&ctx, experience, &scope, &mut outcome).await;
+        }
+
+        queue.extend(
+            scope_queue
+                .sessions
+                .into_iter()
+                .map(|candidate| QueuedSegment {
+                    workspace_id: scope.workspace_id,
+                    project_id: scope.project_id,
+                    workspace_name: scope.workspace_name.clone(),
+                    project_name: scope.project_name.clone(),
+                    candidate,
+                }),
+        );
+    }
+
+    let (selected, burst) = select_for_tick(settings, queue, outcome.queue_len);
+    outcome.burst = burst;
+    outcome.scopes_with_candidates = {
+        let mut projects: Vec<_> = selected.iter().map(|q| *q.project_id.as_bytes()).collect();
+        projects.sort_unstable();
+        projects.dedup();
+        projects.len()
+    };
+
+    for item in selected {
         let ctx = ScheduledAutoImproveContext {
             reader,
             writer,
             wiki,
             llm,
-            workspace_id: scope.workspace_id,
-            project_id: scope.project_id,
+            workspace_id: item.workspace_id,
+            project_id: item.project_id,
             settings,
         };
-
-        // Cross-session ("experience") pass — cadence-gated per scope,
-        // independent of whether this tick has per-session candidates.
-        if let Some(experience) = &settings.experience {
-            match reader
-                .experience_pass_due(scope.workspace_id, scope.project_id)
-                .await
-            {
-                Ok((newer, _)) if newer >= experience.min_new_sessions => {
-                    match run_scheduled_experience(&ctx, experience).await {
-                        Ok(None) => {
-                            tracing::debug!(
-                                workspace = %scope.workspace_name,
-                                project = %scope.project_name,
-                                "experience pass skipped (too few session pages); \
-                                 cadence anchor kept"
-                            );
-                        }
-                        Ok(Some(run)) => {
-                            outcome.experience_runs += 1;
-                            outcome.skipped += run.skipped.len();
-                            if let Err(e) = writer
-                                .mark_experience_pass_run(scope.workspace_id, scope.project_id)
-                                .await
-                            {
-                                outcome.errors += 1;
-                                tracing::warn!(
-                                    workspace = %scope.workspace_name,
-                                    project = %scope.project_name,
-                                    error = %e,
-                                    "experience pass mark failed"
-                                );
-                            }
-                            info!(
-                                workspace = %scope.workspace_name,
-                                project = %scope.project_name,
-                                new_sessions = newer,
-                                run_id = %run.run_id,
-                                proposals = run.proposals,
-                                approved = run.approved,
-                                pending = run.pending,
-                                "experience pass completed"
-                            );
-                        }
-                        Err(e) => {
-                            outcome.errors += 1;
-                            tracing::warn!(
-                                workspace = %scope.workspace_name,
-                                project = %scope.project_name,
-                                error = %e,
-                                "experience pass failed"
-                            );
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    outcome.errors += 1;
-                    tracing::warn!(
-                        workspace = %scope.workspace_name,
-                        project = %scope.project_name,
-                        error = %e,
-                        "experience cadence probe failed"
-                    );
-                }
-            }
-        }
-
-        if candidates.is_empty() {
-            continue;
-        }
-
-        outcome.scopes_with_candidates += 1;
-        for candidate in candidates {
-            let claimed = match ctx
-                .writer
-                .claim_auto_improve_scheduler_session(
-                    ctx.workspace_id,
-                    ctx.project_id,
-                    candidate.session_id,
-                    candidate.ended_at,
-                )
-                .await
-            {
-                Ok(claimed) => claimed,
-                Err(e) => {
-                    outcome.errors += 1;
-                    tracing::warn!(
-                        workspace = %scope.workspace_name,
-                        project = %scope.project_name,
-                        session_id = %candidate.session_id,
-                        error = %e,
-                        "scheduled auto-improve claim failed"
-                    );
-                    continue;
-                }
-            };
-            if !claimed {
-                tracing::debug!(
-                    workspace = %scope.workspace_name,
-                    project = %scope.project_name,
-                    session_id = %candidate.session_id,
-                    "scheduled auto-improve candidate already claimed or reviewed"
-                );
-                continue;
-            }
-            match run_scheduled_auto_improve(&ctx, candidate.session_id).await {
-                Ok(run) => {
-                    outcome.reviewed += 1;
-                    outcome.skipped += run.skipped.len();
-                    info!(
-                        workspace = %scope.workspace_name,
-                        project = %scope.project_name,
-                        session_id = %candidate.session_id,
-                        run_id = %run.run_id,
-                        proposals = run.proposals,
-                        approved = run.approved,
-                        pending = run.pending,
-                        conflicts = run.conflicts,
-                        skipped = run.skipped.len(),
-                        "scheduled auto-improve completed"
-                    );
-                    // The count above keeps every completed run comparable;
-                    // this says WHICH proposal was lost and why, so the
-                    // operator can act on it without querying the store.
-                    for skipped in &run.skipped {
-                        tracing::warn!(
-                            workspace = %scope.workspace_name,
-                            project = %scope.project_name,
-                            session_id = %candidate.session_id,
-                            run_id = %run.run_id,
-                            target_path = %skipped.target_path,
-                            reason = %skipped.reason,
-                            "scheduled auto-improve proposal was not staged"
-                        );
-                    }
-                }
-                Err(e) => {
-                    outcome.errors += 1;
-                    // #833: the claim is this session's only in-flight marker and the
-                    // candidate query excludes on it, so leaving it behind dropped the
-                    // session from every future tick — silently, because the tick
-                    // reports `errors=1` once and clean runs forever after. Release it
-                    // so the next tick retries, and let the attempt counter park it
-                    // once a deterministic failure has proved it will not recover.
-                    let attempts = match ctx
-                        .writer
-                        .record_auto_improve_claim_failure(
-                            ctx.workspace_id,
-                            ctx.project_id,
-                            candidate.session_id,
-                            &e.to_string(),
-                        )
-                        .await
-                    {
-                        Ok(attempts) => Some(attempts),
-                        Err(release_err) => {
-                            // The review already failed; a failed release is a second,
-                            // separate fault and must not mask the first.
-                            tracing::warn!(
-                                workspace = %scope.workspace_name,
-                                project = %scope.project_name,
-                                session_id = %candidate.session_id,
-                                error = %release_err,
-                                "scheduled auto-improve claim release failed"
-                            );
-                            None
-                        }
-                    };
-                    let parked = attempts
-                        .is_some_and(|n| n >= ai_memory_store::AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
-                    if parked {
-                        outcome.parked += 1;
-                    }
-                    tracing::warn!(
-                        workspace = %scope.workspace_name,
-                        project = %scope.project_name,
-                        session_id = %candidate.session_id,
-                        error = %e,
-                        attempts = attempts.unwrap_or(0),
-                        parked,
-                        "scheduled auto-improve failed"
-                    );
-                }
-            }
-        }
+        review_queued_segment(&ctx, &item, &mut outcome).await;
     }
 
     Ok(outcome)
 }
 
+async fn run_experience_if_due(
+    ctx: &ScheduledAutoImproveContext<'_>,
+    experience: &crate::ExperienceConfig,
+    scope: &ai_memory_store::ScopeRow,
+    outcome: &mut ScheduledAutoImproveTickOutcome,
+) {
+    match ctx
+        .reader
+        .experience_pass_due(scope.workspace_id, scope.project_id)
+        .await
+    {
+        Ok((newer, _)) if newer >= experience.min_new_sessions => {
+            match run_scheduled_experience(ctx, experience).await {
+                Ok(None) => {
+                    tracing::debug!(
+                        workspace = %scope.workspace_name,
+                        project = %scope.project_name,
+                        "experience pass skipped (too few session pages); \
+                         cadence anchor kept"
+                    );
+                }
+                Ok(Some(run)) => {
+                    outcome.experience_runs += 1;
+                    outcome.skipped += run.skipped.len();
+                    if let Err(e) = ctx
+                        .writer
+                        .mark_experience_pass_run(scope.workspace_id, scope.project_id)
+                        .await
+                    {
+                        outcome.errors += 1;
+                        tracing::warn!(
+                            workspace = %scope.workspace_name,
+                            project = %scope.project_name,
+                            error = %e,
+                            "experience pass mark failed"
+                        );
+                    }
+                    info!(
+                        workspace = %scope.workspace_name,
+                        project = %scope.project_name,
+                        new_sessions = newer,
+                        run_id = %run.run_id,
+                        proposals = run.proposals,
+                        approved = run.approved,
+                        pending = run.pending,
+                        "experience pass completed"
+                    );
+                }
+                Err(e) => {
+                    outcome.errors += 1;
+                    tracing::warn!(
+                        workspace = %scope.workspace_name,
+                        project = %scope.project_name,
+                        error = %e,
+                        "experience pass failed"
+                    );
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(e) => {
+            outcome.errors += 1;
+            tracing::warn!(
+                workspace = %scope.workspace_name,
+                project = %scope.project_name,
+                error = %e,
+                "experience cadence probe failed"
+            );
+        }
+    }
+}
+
+/// Claim, review and (on success) advance the cursor of one queued segment.
+async fn review_queued_segment(
+    ctx: &ScheduledAutoImproveContext<'_>,
+    item: &QueuedSegment,
+    outcome: &mut ScheduledAutoImproveTickOutcome,
+) {
+    let candidate = item.candidate;
+    let workspace = &item.workspace_name;
+    let project = &item.project_name;
+    let claimed = match ctx
+        .writer
+        .claim_auto_improve_scheduler_session(
+            ctx.workspace_id,
+            ctx.project_id,
+            candidate.session_id,
+            candidate.ended_at,
+        )
+        .await
+    {
+        Ok(claimed) => claimed,
+        Err(e) => {
+            outcome.errors += 1;
+            tracing::warn!(
+                workspace = %workspace,
+                project = %project,
+                session_id = %candidate.session_id,
+                error = %e,
+                "scheduled auto-improve claim failed"
+            );
+            return;
+        }
+    };
+    if !claimed {
+        tracing::debug!(
+            workspace = %workspace,
+            project = %project,
+            session_id = %candidate.session_id,
+            "scheduled auto-improve candidate already claimed or reviewed"
+        );
+        return;
+    }
+    match run_scheduled_auto_improve(ctx, candidate).await {
+        Ok(run) => {
+            outcome.reviewed += 1;
+            outcome.skipped += run.skipped.len();
+            // The review completed: move the cursor past what it read and
+            // release the claim for the next segment. A failure here is
+            // logged, not fatal; the segment is then offered again, which
+            // costs one repeat review, never a missed one.
+            let segments = match candidate.through {
+                Some(through) => match ctx
+                    .writer
+                    .complete_auto_improve_segment(
+                        ctx.workspace_id,
+                        ctx.project_id,
+                        candidate.session_id,
+                        through,
+                    )
+                    .await
+                {
+                    Ok(segments) => Some(segments),
+                    Err(e) => {
+                        outcome.errors += 1;
+                        tracing::warn!(
+                            workspace = %workspace,
+                            project = %project,
+                            session_id = %candidate.session_id,
+                            error = %e,
+                            "scheduled auto-improve cursor advance failed"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            info!(
+                workspace = %workspace,
+                project = %project,
+                session_id = %candidate.session_id,
+                run_id = %run.run_id,
+                trigger = candidate.trigger.as_str(),
+                new_observations = candidate.new_observations,
+                segments_reviewed = segments.unwrap_or(0),
+                proposals = run.proposals,
+                approved = run.approved,
+                pending = run.pending,
+                conflicts = run.conflicts,
+                skipped = run.skipped.len(),
+                "scheduled auto-improve completed"
+            );
+            // The count above keeps every completed run comparable; this says
+            // WHICH proposal was lost and why, so the operator can act on it
+            // without querying the store.
+            for skipped in &run.skipped {
+                tracing::warn!(
+                    workspace = %workspace,
+                    project = %project,
+                    session_id = %candidate.session_id,
+                    run_id = %run.run_id,
+                    target_path = %skipped.target_path,
+                    reason = %skipped.reason,
+                    "scheduled auto-improve proposal was not staged"
+                );
+            }
+        }
+        Err(e) => {
+            outcome.errors += 1;
+            // #833: the claim is this session's only in-flight marker and the
+            // candidate query excludes on it, so leaving it behind dropped the
+            // session from every future tick — silently, because the tick
+            // reports `errors=1` once and clean runs forever after. Release it
+            // so the next tick retries, and let the attempt counter park it
+            // once a deterministic failure has proved it will not recover. The
+            // review cursor is NOT advanced, so the same segment is retried.
+            let attempts = match ctx
+                .writer
+                .record_auto_improve_claim_failure(
+                    ctx.workspace_id,
+                    ctx.project_id,
+                    candidate.session_id,
+                    &e.to_string(),
+                )
+                .await
+            {
+                Ok(attempts) => Some(attempts),
+                Err(release_err) => {
+                    // The review already failed; a failed release is a second,
+                    // separate fault and must not mask the first.
+                    tracing::warn!(
+                        workspace = %workspace,
+                        project = %project,
+                        session_id = %candidate.session_id,
+                        error = %release_err,
+                        "scheduled auto-improve claim release failed"
+                    );
+                    None
+                }
+            };
+            let parked =
+                attempts.is_some_and(|n| n >= ai_memory_store::AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS);
+            if parked {
+                outcome.parked += 1;
+            }
+            tracing::warn!(
+                workspace = %workspace,
+                project = %project,
+                session_id = %candidate.session_id,
+                error = %e,
+                attempts = attempts.unwrap_or(0),
+                parked,
+                "scheduled auto-improve failed"
+            );
+        }
+    }
+}
+
 async fn run_scheduled_auto_improve(
     ctx: &ScheduledAutoImproveContext<'_>,
-    session_id: SessionId,
+    candidate: AutoImproveCandidateSession,
 ) -> Result<ScheduledAutoImproveOutcome> {
     let cfg = ctx.settings.review.clone();
-    let report = run_auto_improve_review(
+    let session_id = candidate.session_id;
+    let report = run_auto_improve_review_segment(
         ctx.reader,
         &**ctx.llm,
         ctx.workspace_id,
         ctx.project_id,
         session_id,
         cfg.clone(),
+        ReviewSegment {
+            after: candidate.after,
+            through: candidate.through,
+        },
     )
     .await?;
     stage_and_apply(ctx, Some(session_id), &report, "scheduler").await
@@ -636,6 +842,81 @@ mod tests {
         }
     }
 
+    /// Returns an empty, valid review: the session had nothing durable.
+    struct EmptyReviewLlm;
+
+    impl LlmProvider for EmptyReviewLlm {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn model(&self) -> &str {
+            "fake-empty"
+        }
+
+        fn complete<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Ok(ChatResponse {
+                    text: "unused".into(),
+                    usage: None,
+                    model: "fake-empty".into(),
+                })
+            })
+        }
+
+        fn complete_structured_raw<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Ok(serde_json::json!({
+                    "summary": "nothing durable",
+                    "proposals": [],
+                    "rejected_candidates": []
+                }))
+            })
+        }
+    }
+
+    /// Give a session `n` substantive observations, `step_ms` apart, so it
+    /// clears the F1 candidate filter (observation floor, duration floor).
+    async fn add_prompts(store: &Store, ws: WorkspaceId, proj: ProjectId, id: SessionId, n: usize) {
+        let base = jiff::Timestamp::now().as_microsecond() - 600_000_000;
+        for i in 0..n {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: Some(base + (i as i64) * 20_000_000),
+                        session_id: id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: ObservationKind::UserPrompt,
+                        extension: None,
+                        source_event: None,
+                        title: format!("prompt {i}"),
+                        body: "run the full gate before release".into(),
+                        importance: 5,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn auto_improve_scheduler_startup_init_preserves_first_interval_sessions() {
         let tmp = TempDir::new().unwrap();
@@ -672,6 +953,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
+            add_prompts(&store, ws, project_id, before_startup_init, 9).await;
             store
                 .writer
                 .end_session(before_startup_init, None)
@@ -703,6 +985,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
+            add_prompts(&store, ws, project_id, session_id, 9).await;
             store.writer.end_session(session_id, None).await.unwrap();
             first_interval_sessions.push((project_id, session_id));
         }
@@ -712,9 +995,13 @@ mod tests {
             require_approval: false,
             min_session_age_secs: 0,
             max_sessions_per_tick: 10,
+            backfill_days: 0,
+            idle_secs: 7_200,
+            max_segment_observations: 200,
+            burst_sessions_per_tick: 4,
             experience: None,
         };
-        let llm: Arc<dyn LlmProvider> = Arc::new(PanicLlm);
+        let llm: Arc<dyn LlmProvider> = Arc::new(EmptyReviewLlm);
         let outcome =
             run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
                 .await
@@ -729,7 +1016,12 @@ mod tests {
         for (project_id, session_id) in first_interval_sessions {
             let candidates = store
                 .reader
-                .auto_improve_candidate_sessions(ws, project_id, 0, 10)
+                .auto_improve_candidate_sessions(
+                    ws,
+                    project_id,
+                    AutoImproveCandidateCriteria::unfiltered(0),
+                    10,
+                )
                 .await
                 .unwrap();
             assert!(
@@ -737,6 +1029,492 @@ mod tests {
                 "first-interval session should have been reviewed or claimed"
             );
         }
+    }
+
+    /// F1 (FN8-10125): the cheap preflight runs before the claim, so sessions
+    /// that would be skipped (too few observations, boundary-only) never take
+    /// the one slot a tick has, and leave no claim or run row. Here the starved
+    /// slot belonged to the OLDEST session; the rich one behind it must still
+    /// be reviewed in the same tick.
+    #[tokio::test]
+    async fn preflight_failures_never_consume_a_scheduler_slot() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "proj", None)
+            .await
+            .unwrap();
+
+        let mut sparse = Vec::new();
+        for _ in 0..3 {
+            let id = SessionId::new();
+            store
+                .writer
+                .begin_session(NewSession {
+                    occurred_at: None,
+                    id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    agent_kind: AgentKind::Other,
+                    cwd: None,
+                    actor_user: None,
+                })
+                .await
+                .unwrap();
+            // Start, stop, session-end: the AGY shape that starved the queue.
+            for kind in [
+                ObservationKind::SessionStart,
+                ObservationKind::Stop,
+                ObservationKind::SessionEnd,
+            ] {
+                store
+                    .writer
+                    .insert_observation(Sanitized::new(
+                        NewObservation {
+                            occurred_at: None,
+                            session_id: id,
+                            workspace_id: ws,
+                            project_id: proj,
+                            kind,
+                            extension: None,
+                            source_event: None,
+                            title: "boundary".into(),
+                            body: String::new(),
+                            importance: 5,
+                        },
+                        &Sanitizer::builtin(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            store.writer.end_session(id, None).await.unwrap();
+            sparse.push(id);
+        }
+        let rich = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: rich,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        add_prompts(&store, ws, proj, rich, 9).await;
+        store.writer.end_session(rich, None).await.unwrap();
+
+        let settings = ScheduledAutoImproveSettings {
+            review: AutoImproveReviewConfig::default(),
+            require_approval: true,
+            min_session_age_secs: 0,
+            max_sessions_per_tick: 1,
+            backfill_days: 0,
+            idle_secs: 7_200,
+            max_segment_observations: 200,
+            burst_sessions_per_tick: 4,
+            experience: None,
+        };
+        let llm: Arc<dyn LlmProvider> = Arc::new(EmptyReviewLlm);
+        let tick =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+                .await
+                .unwrap();
+        assert_eq!(tick.reviewed, 1, "the rich session got the slot: {tick:?}");
+        assert_eq!(tick.errors, 0, "{tick:?}");
+
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        for id in &sparse {
+            let rows: i64 = conn
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM auto_improve_scheduler_claims WHERE session_id = ?1) \
+                          + (SELECT COUNT(*) FROM auto_improve_runs WHERE session_id = ?1)",
+                    rusqlite::params![id.as_bytes()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 0, "a preflight failure leaves no claim and no run");
+        }
+    }
+
+    /// Records every prompt it is asked to review and returns an empty review.
+    /// The first `fail_first` calls fail instead.
+    struct RecordingLlm {
+        prompts: Mutex<Vec<String>>,
+        fail_first: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RecordingLlm {
+        fn new(fail_first: usize) -> Arc<Self> {
+            Arc::new(Self {
+                prompts: Mutex::new(Vec::new()),
+                fail_first: std::sync::atomic::AtomicUsize::new(fail_first),
+            })
+        }
+
+        fn calls(&self) -> usize {
+            self.prompts.lock().unwrap().len()
+        }
+
+        fn last_prompt(&self) -> String {
+            self.prompts
+                .lock()
+                .unwrap()
+                .last()
+                .cloned()
+                .unwrap_or_default()
+        }
+    }
+
+    impl LlmProvider for RecordingLlm {
+        fn name(&self) -> &'static str {
+            "recording"
+        }
+
+        fn model(&self) -> &str {
+            "recording"
+        }
+
+        fn complete<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move { panic!("structured calls only") })
+        }
+
+        fn complete_structured_raw<'life0, 'async_trait>(
+            &'life0 self,
+            request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            self.prompts
+                .lock()
+                .unwrap()
+                .push(request.messages[0].content.clone());
+            let fail = self
+                .fail_first
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| n.checked_sub(1),
+                )
+                .is_ok();
+            Box::pin(async move {
+                if fail {
+                    Err(ai_memory_llm::LlmError::Provider {
+                        status: 500,
+                        body: "injected failure".into(),
+                    })
+                } else {
+                    Ok(serde_json::json!({
+                        "summary": "nothing durable",
+                        "proposals": [],
+                        "rejected_candidates": []
+                    }))
+                }
+            })
+        }
+    }
+
+    fn segment_settings() -> ScheduledAutoImproveSettings {
+        ScheduledAutoImproveSettings {
+            review: AutoImproveReviewConfig::default(),
+            require_approval: true,
+            min_session_age_secs: 0,
+            max_sessions_per_tick: 1,
+            backfill_days: 0,
+            idle_secs: 7_200,
+            max_segment_observations: 200,
+            burst_sessions_per_tick: 4,
+            experience: None,
+        }
+    }
+
+    async fn new_scope(store: &Store, name: &str) -> (WorkspaceId, ProjectId) {
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, name, None)
+            .await
+            .unwrap();
+        (ws, proj)
+    }
+
+    /// A rich session (9 prompts, 20 s apart) whose last observation is
+    /// `last_at_us`, carrying `tag` in every body so a prompt can be checked for
+    /// which observations it contains. Optionally ended.
+    async fn rich_session_at(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        last_at_us: i64,
+        tag: &str,
+        ended: bool,
+    ) -> SessionId {
+        let id = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: Some(last_at_us - 200_000_000),
+                id,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        add_tagged(store, ws, proj, id, last_at_us, tag, 9).await;
+        if ended {
+            store.writer.end_session(id, None).await.unwrap();
+        }
+        id
+    }
+
+    async fn add_tagged(
+        store: &Store,
+        ws: WorkspaceId,
+        proj: ProjectId,
+        id: SessionId,
+        last_at_us: i64,
+        tag: &str,
+        n: usize,
+    ) {
+        for i in 0..n {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: Some(last_at_us - (n - 1 - i) as i64 * 20_000_000),
+                        session_id: id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: ObservationKind::UserPrompt,
+                        extension: None,
+                        source_event: None,
+                        title: format!("{tag}-{i}"),
+                        body: format!("{tag} observation body {i}"),
+                        importance: 5,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+    }
+
+    fn cursor_rows(store: &Store) -> i64 {
+        rusqlite::Connection::open(store.db_path())
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM auto_improve_session_cursor",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    const HOUR_US: i64 = 3_600_000_000;
+
+    /// F2: an open session idle for two hours is reviewed, only its new
+    /// observations are ever sent to the model, and a later segment of the same
+    /// session reads nothing the first one already covered.
+    #[tokio::test]
+    async fn an_idle_open_session_is_reviewed_in_segments_and_never_twice() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let (ws, proj) = new_scope(&store, "proj").await;
+        let now = jiff::Timestamp::now().as_microsecond();
+        let session = rich_session_at(&store, ws, proj, now - 5 * HOUR_US, "OLDSEG", false).await;
+
+        let recorder = RecordingLlm::new(0);
+        let llm: Arc<dyn LlmProvider> = recorder.clone();
+        let settings = segment_settings();
+        let tick = |settings: ScheduledAutoImproveSettings| {
+            let (reader, writer, wiki, llm) = (&store.reader, &store.writer, &wiki, &llm);
+            async move {
+                run_auto_improve_scheduler_tick(reader, writer, wiki, llm, &settings)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let first = tick(settings.clone()).await;
+        assert_eq!((first.reviewed, first.errors), (1, 0), "{first:?}");
+        assert_eq!(recorder.calls(), 1);
+        assert!(recorder.last_prompt().contains("OLDSEG observation body"));
+        assert_eq!(cursor_rows(&store), 1);
+
+        // Nothing new: the same observations are not offered again.
+        let second = tick(settings.clone()).await;
+        assert_eq!((second.reviewed, second.queue_len), (0, 0), "{second:?}");
+        assert_eq!(recorder.calls(), 1);
+
+        // The session resumes, then goes quiet for 2 h: one new segment.
+        add_tagged(&store, ws, proj, session, now - 3 * HOUR_US, "NEWSEG", 9).await;
+        let third = tick(settings.clone()).await;
+        assert_eq!((third.reviewed, third.errors), (1, 0), "{third:?}");
+        assert_eq!(recorder.calls(), 2);
+        let prompt = recorder.last_prompt();
+        assert!(prompt.contains("NEWSEG observation body"));
+        assert!(
+            !prompt.contains("OLDSEG observation body"),
+            "the first segment was already reviewed"
+        );
+        let cursor = store
+            .reader
+            .auto_improve_session_cursor(session)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cursor.segments_reviewed, 2);
+    }
+
+    /// F2: a failed review leaves the cursor, the segment is retried, and the
+    /// retry reads the same observations.
+    #[tokio::test]
+    async fn a_failed_segment_review_keeps_the_cursor_and_is_retried() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let (ws, proj) = new_scope(&store, "proj").await;
+        let now = jiff::Timestamp::now().as_microsecond();
+        let session = rich_session_at(&store, ws, proj, now - 5 * HOUR_US, "SEG", false).await;
+
+        let recorder = RecordingLlm::new(1);
+        let llm: Arc<dyn LlmProvider> = recorder.clone();
+        let settings = segment_settings();
+
+        let failed =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+                .await
+                .unwrap();
+        assert_eq!((failed.reviewed, failed.errors), (0, 1), "{failed:?}");
+        assert_eq!(cursor_rows(&store), 0, "no cursor after a failed review");
+        assert!(
+            store
+                .reader
+                .auto_improve_session_cursor(session)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let retried =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+                .await
+                .unwrap();
+        assert_eq!((retried.reviewed, retried.errors), (1, 0), "{retried:?}");
+        assert_eq!(recorder.calls(), 2);
+        assert!(recorder.last_prompt().contains("SEG observation body"));
+        assert_eq!(cursor_rows(&store), 1);
+    }
+
+    /// F2: while the queue is deeper than the per-project budget a tick reviews
+    /// up to `burst_sessions_per_tick` segments globally; once the queue fits
+    /// the per-project budget it falls back to one per project.
+    #[tokio::test]
+    async fn burst_budget_applies_only_while_the_queue_is_deep() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let (ws, alpha) = new_scope(&store, "alpha").await;
+        let (_, beta) = new_scope(&store, "beta").await;
+        let now = jiff::Timestamp::now().as_microsecond();
+        for i in 0..6 {
+            rich_session_at(&store, ws, alpha, now - 6 * HOUR_US + i * 1_000, "A", true).await;
+        }
+
+        let recorder = RecordingLlm::new(0);
+        let llm: Arc<dyn LlmProvider> = recorder.clone();
+        let settings = segment_settings();
+        let run = || async {
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+                .await
+                .unwrap()
+        };
+
+        let first = run().await;
+        assert!(first.burst, "{first:?}");
+        assert_eq!((first.queue_len, first.reviewed), (6, 4), "{first:?}");
+        let second = run().await;
+        assert!(second.burst, "{second:?}");
+        assert_eq!((second.queue_len, second.reviewed), (2, 2), "{second:?}");
+        let drained = run().await;
+        assert_eq!((drained.queue_len, drained.reviewed), (0, 0), "{drained:?}");
+
+        // One eligible segment per project: the queue fits the per-project
+        // budget, so this is a normal tick, not a burst.
+        rich_session_at(&store, ws, alpha, now - 5 * HOUR_US, "A2", true).await;
+        rich_session_at(&store, ws, beta, now - 5 * HOUR_US, "B2", true).await;
+        let normal = run().await;
+        assert!(!normal.burst, "{normal:?}");
+        assert_eq!((normal.queue_len, normal.reviewed), (2, 2), "{normal:?}");
+
+        // With the burst disabled the per-project budget always applies.
+        for _ in 0..3 {
+            rich_session_at(&store, ws, alpha, now - 4 * HOUR_US, "A3", true).await;
+        }
+        let mut capped = settings.clone();
+        capped.burst_sessions_per_tick = 0;
+        let tick =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &capped)
+                .await
+                .unwrap();
+        assert!(!tick.burst);
+        assert_eq!((tick.queue_len, tick.reviewed), (3, 1), "{tick:?}");
+    }
+
+    /// F2: when the queue fits the per-project budget the tick is a normal one
+    /// and no project exceeds `max_sessions_per_tick`.
+    #[tokio::test]
+    async fn a_normal_tick_caps_each_project_at_its_own_budget() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let (ws, alpha) = new_scope(&store, "alpha").await;
+        let (_, beta) = new_scope(&store, "beta").await;
+        let now = jiff::Timestamp::now().as_microsecond();
+        for i in 0..3 {
+            rich_session_at(&store, ws, alpha, now - 6 * HOUR_US + i * 1_000, "A", true).await;
+        }
+        rich_session_at(&store, ws, beta, now - 6 * HOUR_US, "B", true).await;
+
+        let recorder = RecordingLlm::new(0);
+        let llm: Arc<dyn LlmProvider> = recorder.clone();
+        let mut settings = segment_settings();
+        settings.max_sessions_per_tick = 2;
+        let tick =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+                .await
+                .unwrap();
+        // 4 queued, 2 projects x 2 budget = 4: not deep, so not a burst.
+        assert!(!tick.burst, "{tick:?}");
+        assert_eq!((tick.queue_len, tick.reviewed), (4, 3), "{tick:?}");
     }
 
     /// Cross-session fake: proposes one procedure citing two sessions.
@@ -867,6 +1645,10 @@ mod tests {
             // Per-session path effectively off: the fake sessions have no
             // observations, so preflight rejects them anyway.
             max_sessions_per_tick: 10,
+            backfill_days: 0,
+            idle_secs: 7_200,
+            max_segment_observations: 200,
+            burst_sessions_per_tick: 4,
             experience: Some(crate::ExperienceConfig {
                 sessions: 10,
                 min_new_sessions: 3,
@@ -975,6 +1757,10 @@ mod tests {
             require_approval: true,
             min_session_age_secs: 0,
             max_sessions_per_tick: 10,
+            backfill_days: 0,
+            idle_secs: 7_200,
+            max_segment_observations: 200,
+            burst_sessions_per_tick: 4,
             experience: Some(crate::ExperienceConfig {
                 sessions: 10,
                 min_new_sessions: 3,
@@ -1187,6 +1973,10 @@ mod tests {
             require_approval: true,
             min_session_age_secs: 0,
             max_sessions_per_tick: 10,
+            backfill_days: 0,
+            idle_secs: 7_200,
+            max_segment_observations: 200,
+            burst_sessions_per_tick: 4,
             experience: None,
         };
         let llm: Arc<dyn LlmProvider> = Arc::new(OneProposalLlm);
@@ -1200,7 +1990,15 @@ mod tests {
             settings: &settings,
         };
 
-        let run = run_scheduled_auto_improve(&ctx, session_id).await.unwrap();
+        let candidate = store
+            .reader
+            .auto_improve_candidate_sessions(ws, proj, candidate_criteria(&settings), 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| c.session_id == session_id)
+            .expect("the seeded session is a candidate");
+        let run = run_scheduled_auto_improve(&ctx, candidate).await.unwrap();
         assert_eq!(run.proposals, 0, "the only proposal collided");
         assert_eq!(
             run.skipped.len(),
