@@ -84,7 +84,7 @@ Daily, per agent:
 - open-session coverage;
 - queue length.
 
-## Out of scope (later phases)
+## Later phases (deferred by the operator's Q1 decision, 2026-10-28, FN8-10125)
 
 - **F3:** AGY prompt and assistant text from `transcriptPath`, read incrementally by byte offset. Muse Code as a new
   `AgentKind` with its hook set.
