@@ -18,8 +18,8 @@ use std::sync::Arc;
 use ai_memory_core::{ActorContext, PagePath, ProjectId, SessionId, WorkspaceId};
 use ai_memory_llm::LlmProvider;
 use ai_memory_store::{
-    ApproveAutoImproveProposalResult, AutoImproveProposalOperation, NewAutoImproveProposal,
-    ReaderPool, SkippedProposal, StageAutoImproveRun, WriterHandle,
+    ApproveAutoImproveProposalResult, AutoImproveCandidateCriteria, AutoImproveProposalOperation,
+    NewAutoImproveProposal, ReaderPool, SkippedProposal, StageAutoImproveRun, WriterHandle,
 };
 use ai_memory_wiki::Wiki;
 use anyhow::Result;
@@ -43,6 +43,10 @@ pub struct ScheduledAutoImproveSettings {
     /// Maximum sessions reviewed per scope per tick
     /// (`[auto_improve.scheduler] max_sessions_per_tick`).
     pub max_sessions_per_tick: usize,
+    /// One-time backfill horizon in days (`[auto_improve.scheduler]
+    /// backfill_days`). Sessions that ended inside the horizon but under the
+    /// startup watermark become eligible once per scope. `0` disables.
+    pub backfill_days: u64,
     /// Cross-session ("experience") pass settings; `None` = disabled
     /// (`[auto_improve.experience]`, docs/experience.md).
     pub experience: Option<crate::ExperienceConfig>,
@@ -77,6 +81,18 @@ pub async fn initialize_auto_improve_scheduler_scopes(
         }
     }
     Ok((total, errors))
+}
+
+/// The candidate filter for a tick. The cheap preflight the reviewer applies
+/// (observation floor, duration floor) moves here so a session that would be
+/// skipped never spends a scheduler slot (FN8-10125, F1).
+fn candidate_criteria(settings: &ScheduledAutoImproveSettings) -> AutoImproveCandidateCriteria {
+    AutoImproveCandidateCriteria {
+        min_session_age_secs: settings.min_session_age_secs,
+        min_observations: settings.review.min_observations,
+        min_session_duration_secs: settings.review.min_session_duration_secs,
+        require_substantive: true,
+    }
 }
 
 struct ScheduledAutoImproveOutcome {
@@ -160,11 +176,40 @@ pub async fn run_auto_improve_scheduler_tick(
             continue;
         }
 
+        if settings.backfill_days > 0 {
+            match writer
+                .apply_auto_improve_backfill(
+                    scope.workspace_id,
+                    scope.project_id,
+                    settings.backfill_days.saturating_mul(86_400),
+                )
+                .await
+            {
+                Ok(true) => info!(
+                    workspace = %scope.workspace_name,
+                    project = %scope.project_name,
+                    backfill_days = settings.backfill_days,
+                    "auto-improve one-time backfill applied"
+                ),
+                Ok(false) => {}
+                Err(e) => {
+                    outcome.errors += 1;
+                    tracing::warn!(
+                        workspace = %scope.workspace_name,
+                        project = %scope.project_name,
+                        error = %e,
+                        "scheduled auto-improve backfill failed"
+                    );
+                    continue;
+                }
+            }
+        }
+
         let candidates = match reader
             .auto_improve_candidate_sessions(
                 scope.workspace_id,
                 scope.project_id,
-                settings.min_session_age_secs,
+                candidate_criteria(settings),
                 settings.max_sessions_per_tick,
             )
             .await
@@ -636,6 +681,81 @@ mod tests {
         }
     }
 
+    /// Returns an empty, valid review: the session had nothing durable.
+    struct EmptyReviewLlm;
+
+    impl LlmProvider for EmptyReviewLlm {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        fn model(&self) -> &str {
+            "fake-empty"
+        }
+
+        fn complete<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<ChatResponse>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Ok(ChatResponse {
+                    text: "unused".into(),
+                    usage: None,
+                    model: "fake-empty".into(),
+                })
+            })
+        }
+
+        fn complete_structured_raw<'life0, 'async_trait>(
+            &'life0 self,
+            _request: ChatRequest,
+            _schema: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = LlmResult<serde_json::Value>> + Send + 'async_trait>>
+        where
+            'life0: 'async_trait,
+            Self: 'async_trait,
+        {
+            Box::pin(async move {
+                Ok(serde_json::json!({
+                    "summary": "nothing durable",
+                    "proposals": [],
+                    "rejected_candidates": []
+                }))
+            })
+        }
+    }
+
+    /// Give a session `n` substantive observations, `step_ms` apart, so it
+    /// clears the F1 candidate filter (observation floor, duration floor).
+    async fn add_prompts(store: &Store, ws: WorkspaceId, proj: ProjectId, id: SessionId, n: usize) {
+        let base = jiff::Timestamp::now().as_microsecond() - 600_000_000;
+        for i in 0..n {
+            store
+                .writer
+                .insert_observation(Sanitized::new(
+                    NewObservation {
+                        occurred_at: Some(base + (i as i64) * 20_000_000),
+                        session_id: id,
+                        workspace_id: ws,
+                        project_id: proj,
+                        kind: ObservationKind::UserPrompt,
+                        extension: None,
+                        source_event: None,
+                        title: format!("prompt {i}"),
+                        body: "run the full gate before release".into(),
+                        importance: 5,
+                    },
+                    &Sanitizer::builtin(),
+                ))
+                .await
+                .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn auto_improve_scheduler_startup_init_preserves_first_interval_sessions() {
         let tmp = TempDir::new().unwrap();
@@ -672,6 +792,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
+            add_prompts(&store, ws, project_id, before_startup_init, 9).await;
             store
                 .writer
                 .end_session(before_startup_init, None)
@@ -703,6 +824,7 @@ mod tests {
                 })
                 .await
                 .unwrap();
+            add_prompts(&store, ws, project_id, session_id, 9).await;
             store.writer.end_session(session_id, None).await.unwrap();
             first_interval_sessions.push((project_id, session_id));
         }
@@ -712,9 +834,10 @@ mod tests {
             require_approval: false,
             min_session_age_secs: 0,
             max_sessions_per_tick: 10,
+            backfill_days: 0,
             experience: None,
         };
-        let llm: Arc<dyn LlmProvider> = Arc::new(PanicLlm);
+        let llm: Arc<dyn LlmProvider> = Arc::new(EmptyReviewLlm);
         let outcome =
             run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
                 .await
@@ -729,13 +852,131 @@ mod tests {
         for (project_id, session_id) in first_interval_sessions {
             let candidates = store
                 .reader
-                .auto_improve_candidate_sessions(ws, project_id, 0, 10)
+                .auto_improve_candidate_sessions(
+                    ws,
+                    project_id,
+                    AutoImproveCandidateCriteria::unfiltered(0),
+                    10,
+                )
                 .await
                 .unwrap();
             assert!(
                 candidates.iter().all(|c| c.session_id != session_id),
                 "first-interval session should have been reviewed or claimed"
             );
+        }
+    }
+
+    /// F1 (FN8-10125): the cheap preflight runs before the claim, so sessions
+    /// that would be skipped (too few observations, boundary-only) never take
+    /// the one slot a tick has, and leave no claim or run row. Here the starved
+    /// slot belonged to the OLDEST session; the rich one behind it must still
+    /// be reviewed in the same tick.
+    #[tokio::test]
+    async fn preflight_failures_never_consume_a_scheduler_slot() {
+        let tmp = TempDir::new().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let wiki = Wiki::new(tmp.path(), store.writer.clone()).unwrap();
+        let ws = store
+            .writer
+            .get_or_create_workspace("default")
+            .await
+            .unwrap();
+        let proj = store
+            .writer
+            .get_or_create_project(ws, "proj", None)
+            .await
+            .unwrap();
+
+        let mut sparse = Vec::new();
+        for _ in 0..3 {
+            let id = SessionId::new();
+            store
+                .writer
+                .begin_session(NewSession {
+                    occurred_at: None,
+                    id,
+                    workspace_id: ws,
+                    project_id: proj,
+                    agent_kind: AgentKind::Other,
+                    cwd: None,
+                    actor_user: None,
+                })
+                .await
+                .unwrap();
+            // Start, stop, session-end: the AGY shape that starved the queue.
+            for kind in [
+                ObservationKind::SessionStart,
+                ObservationKind::Stop,
+                ObservationKind::SessionEnd,
+            ] {
+                store
+                    .writer
+                    .insert_observation(Sanitized::new(
+                        NewObservation {
+                            occurred_at: None,
+                            session_id: id,
+                            workspace_id: ws,
+                            project_id: proj,
+                            kind,
+                            extension: None,
+                            source_event: None,
+                            title: "boundary".into(),
+                            body: String::new(),
+                            importance: 5,
+                        },
+                        &Sanitizer::builtin(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            store.writer.end_session(id, None).await.unwrap();
+            sparse.push(id);
+        }
+        let rich = SessionId::new();
+        store
+            .writer
+            .begin_session(NewSession {
+                occurred_at: None,
+                id: rich,
+                workspace_id: ws,
+                project_id: proj,
+                agent_kind: AgentKind::Other,
+                cwd: None,
+                actor_user: None,
+            })
+            .await
+            .unwrap();
+        add_prompts(&store, ws, proj, rich, 9).await;
+        store.writer.end_session(rich, None).await.unwrap();
+
+        let settings = ScheduledAutoImproveSettings {
+            review: AutoImproveReviewConfig::default(),
+            require_approval: true,
+            min_session_age_secs: 0,
+            max_sessions_per_tick: 1,
+            backfill_days: 0,
+            experience: None,
+        };
+        let llm: Arc<dyn LlmProvider> = Arc::new(EmptyReviewLlm);
+        let tick =
+            run_auto_improve_scheduler_tick(&store.reader, &store.writer, &wiki, &llm, &settings)
+                .await
+                .unwrap();
+        assert_eq!(tick.reviewed, 1, "the rich session got the slot: {tick:?}");
+        assert_eq!(tick.errors, 0, "{tick:?}");
+
+        let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+        for id in &sparse {
+            let rows: i64 = conn
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM auto_improve_scheduler_claims WHERE session_id = ?1) \
+                          + (SELECT COUNT(*) FROM auto_improve_runs WHERE session_id = ?1)",
+                    rusqlite::params![id.as_bytes()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 0, "a preflight failure leaves no claim and no run");
         }
     }
 
@@ -867,6 +1108,7 @@ mod tests {
             // Per-session path effectively off: the fake sessions have no
             // observations, so preflight rejects them anyway.
             max_sessions_per_tick: 10,
+            backfill_days: 0,
             experience: Some(crate::ExperienceConfig {
                 sessions: 10,
                 min_new_sessions: 3,
@@ -975,6 +1217,7 @@ mod tests {
             require_approval: true,
             min_session_age_secs: 0,
             max_sessions_per_tick: 10,
+            backfill_days: 0,
             experience: Some(crate::ExperienceConfig {
                 sessions: 10,
                 min_new_sessions: 3,
@@ -1187,6 +1430,7 @@ mod tests {
             require_approval: true,
             min_session_age_secs: 0,
             max_sessions_per_tick: 10,
+            backfill_days: 0,
             experience: None,
         };
         let llm: Arc<dyn LlmProvider> = Arc::new(OneProposalLlm);

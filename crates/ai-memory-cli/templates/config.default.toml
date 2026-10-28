@@ -225,6 +225,12 @@ enabled = true
 interval_secs = 3600
 max_sessions_per_tick = 1 # per project
 min_session_age_secs = 600
+# One-time backfill: sessions that ended within this many days but BEFORE the
+# scheduler's startup watermark become eligible once per project, so recent
+# history is reviewed instead of silently skipped. Older history stays out.
+# Sessions already reviewed or claimed are never re-queued. 0 = never review
+# history that predates the scheduler's first run.
+backfill_days = 30
 
 # How a mid-session event is attributed when the agent's cwd has moved since
 # the session started. Session-CREATING events always resolve from their own

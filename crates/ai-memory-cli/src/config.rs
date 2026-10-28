@@ -1017,6 +1017,11 @@ pub struct AutoImproveSchedulerSettings {
     pub max_sessions_per_tick: usize,
     /// Minimum age after SessionEnd before a session becomes eligible.
     pub min_session_age_secs: u64,
+    /// One-time backfill horizon in days (FN8-10125). Sessions that ended
+    /// inside this horizon but before the startup watermark become eligible
+    /// once per project; older history stays excluded. `0` disables the
+    /// backfill, restoring "never review history on upgrade".
+    pub backfill_days: u64,
     /// Cross-session ("experience") pass: run after this many NEW
     /// completed sessions per project. `0` (default) disables the pass —
     /// it is opt-in and shaped by docs/experience.md.
@@ -1037,6 +1042,7 @@ impl Default for AutoImproveSchedulerSettings {
             interval_secs: 3_600,
             max_sessions_per_tick: 1,
             min_session_age_secs: 600,
+            backfill_days: 30,
             experience_every_sessions: 0,
             experience_sessions: 10,
             experience_entropy_filter: ai_memory_consolidate::EntropyFilterConfig::default(),
@@ -2462,6 +2468,7 @@ mod tests {
         assert_eq!(cfg.auto_improve.scheduler.interval_secs, 3_600);
         assert_eq!(cfg.auto_improve.scheduler.max_sessions_per_tick, 1);
         assert_eq!(cfg.auto_improve.scheduler.min_session_age_secs, 600);
+        assert_eq!(cfg.auto_improve.scheduler.backfill_days, 30);
         assert!(!cfg.auto_improve.on_session_end);
         assert!(!cfg.auto_improve.require_approval);
         assert_eq!(cfg.auto_improve.min_observations, 8);

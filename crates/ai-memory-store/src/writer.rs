@@ -620,6 +620,12 @@ pub(crate) enum WriteCmd {
         error: String,
         reply: oneshot::Sender<StoreResult<u32>>,
     },
+    ApplyAutoImproveBackfill {
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        horizon_secs: u64,
+        reply: oneshot::Sender<StoreResult<bool>>,
+    },
     RecordMaintenanceJobSuccess {
         job: crate::maintenance::MaintenanceJob,
         reply: oneshot::Sender<StoreResult<()>>,
@@ -2591,6 +2597,31 @@ impl WriterHandle {
         rx.await.map_err(|_| StoreError::WriterClosed)?
     }
 
+    /// Lower a scope's scheduler watermark to `now - horizon_secs`, exactly once
+    /// per scope, so recent history that ended before the startup watermark
+    /// becomes reviewable (FN8-10125, F1). Returns `true` only on the call that
+    /// applied it; every later call is a no-op. A watermark already below the
+    /// floor is left alone: the backfill never narrows what is eligible.
+    ///
+    /// # Errors
+    /// Returns an error when the writer is closed or the statement fails.
+    pub async fn apply_auto_improve_backfill(
+        &self,
+        workspace_id: WorkspaceId,
+        project_id: ProjectId,
+        horizon_secs: u64,
+    ) -> StoreResult<bool> {
+        let (tx, rx) = oneshot::channel();
+        self.send(WriteCmd::ApplyAutoImproveBackfill {
+            workspace_id,
+            project_id,
+            horizon_secs,
+            reply: tx,
+        })
+        .await?;
+        rx.await.map_err(|_| StoreError::WriterClosed)?
+    }
+
     /// Persist a global maintenance job's successful completion time.
     pub async fn record_maintenance_job_success(
         &self,
@@ -3665,6 +3696,20 @@ fn worker_loop(mut conn: Connection, mut rx: mpsc::Receiver<WriteCmd>) {
                     &error,
                 );
                 send_or_warn(reply, result, "record_auto_improve_claim_failure");
+            }
+            WriteCmd::ApplyAutoImproveBackfill {
+                workspace_id,
+                project_id,
+                horizon_secs,
+                reply,
+            } => {
+                let result = crate::auto_improve::apply_backfill(
+                    &conn,
+                    workspace_id,
+                    project_id,
+                    horizon_secs,
+                );
+                send_or_warn(reply, result, "apply_auto_improve_backfill");
             }
             WriteCmd::RecordMaintenanceJobSuccess { job, reply } => {
                 let result = crate::maintenance::record_success(&conn, job);

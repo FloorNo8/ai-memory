@@ -510,6 +510,44 @@ pub fn ensure_scheduler_state(
     Ok(())
 }
 
+/// Lower the scope's watermark to the backfill horizon floor, once.
+///
+/// The watermark is seeded at the newest already-ended session so an upgrade
+/// does not review history by default. This lets sessions that ended inside the
+/// horizon (`now - horizon_secs`) but under that watermark enter the queue. It
+/// only ever moves the watermark down, and `backfill_applied_at` makes it a
+/// one-shot per scope: a restart cannot repeat it. Sessions that already hold a
+/// run or a claim stay excluded by the candidate query, so nothing is
+/// re-reviewed.
+///
+/// Returns `true` when this call applied the backfill, `false` when it had been
+/// applied before or the scope has no scheduler state yet.
+///
+/// # Errors
+/// Returns an error when the underlying SQLite statement fails.
+pub fn apply_backfill(
+    conn: &Connection,
+    workspace_id: WorkspaceId,
+    project_id: ProjectId,
+    horizon_secs: u64,
+) -> StoreResult<bool> {
+    let now = Timestamp::now().as_microsecond();
+    let horizon_us = i64::try_from(horizon_secs)
+        .unwrap_or(i64::MAX / 1_000_000)
+        .saturating_mul(1_000_000);
+    let floor = now.saturating_sub(horizon_us);
+    let updated = conn.execute(
+        "UPDATE auto_improve_scheduler_state \
+         SET watermark_ended_at = MIN(watermark_ended_at, ?3), \
+             backfill_applied_at = ?4, \
+             updated_at = ?4 \
+         WHERE workspace_id = ?1 AND project_id = ?2 \
+           AND backfill_applied_at IS NULL",
+        params![workspace_id.as_bytes(), project_id.as_bytes(), floor, now],
+    )?;
+    Ok(updated == 1)
+}
+
 /// Cross-session ("experience") pass cadence probe — 2.0 item 6.
 /// Counts completed sessions newer than the pass's last run (or the
 /// scope's initialization, so enabling the pass never re-digests

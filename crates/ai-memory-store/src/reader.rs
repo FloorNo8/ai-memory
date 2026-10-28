@@ -695,6 +695,41 @@ pub struct PageHit {
     pub pinned: bool,
 }
 
+/// What a session must look like before the scheduler spends a slot on it.
+///
+/// These are the cheap preflight checks the reviewer used to run only after the
+/// claim (FN8-10125, F1). Evaluating them while selecting candidates means a
+/// session that fails them never consumes a scheduler slot or leaves a claim or
+/// run row behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoImproveCandidateCriteria {
+    /// Minimum age after `ended_at` before a completed session is eligible.
+    pub min_session_age_secs: u64,
+    /// Minimum observation count (`[auto_improve] min_observations`). `0` disables.
+    pub min_observations: usize,
+    /// Minimum first-to-last observation span
+    /// (`[auto_improve] min_session_duration_secs`). `0` disables.
+    pub min_session_duration_secs: u64,
+    /// Reject a session whose observations are all lifecycle boundaries (start,
+    /// stop, end, notification): no `user-prompt`, `pre-tool-use` or
+    /// `post-tool-use`. Mirrors the hook router's `is_ephemeral_session`.
+    pub require_substantive: bool,
+}
+
+impl AutoImproveCandidateCriteria {
+    /// Age cutoff only, with no content preflight. This is the pre-F1 behavior;
+    /// the scheduler does not use it.
+    #[must_use]
+    pub const fn unfiltered(min_session_age_secs: u64) -> Self {
+        Self {
+            min_session_age_secs,
+            min_observations: 0,
+            min_session_duration_secs: 0,
+            require_substantive: false,
+        }
+    }
+}
+
 /// Completed session selected for scheduled auto-improvement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AutoImproveCandidateSession {
@@ -3457,15 +3492,25 @@ impl ReaderPool {
         .await
     }
 
-    /// Return completed sessions eligible for scheduled auto-improvement.
+    /// Return sessions eligible for scheduled auto-improvement.
     ///
     /// The scheduler uses a persisted first-run watermark so an upgrade with an
     /// LLM provider configured does not chew through historical backlog by
-    /// default. The scheduler inserts a per-session claim before the LLM call,
-    /// so failed scheduled reviews do not retry forever or starve newer
-    /// sessions. Any existing auto-improvement run row for a session also counts
-    /// as a scheduler review for candidate selection; manual reruns remain
-    /// available through CLI/admin/MCP.
+    /// default (a one-time, horizon-bounded backfill lowers it, see
+    /// [`crate::auto_improve::apply_backfill`]). The scheduler inserts a
+    /// per-session claim before the LLM call, so failed scheduled reviews do not
+    /// retry forever or starve newer sessions. Any existing auto-improvement run
+    /// row for a session also counts as a scheduler review for candidate
+    /// selection; manual reruns remain available through CLI/admin/MCP.
+    ///
+    /// The cheap preflight lives here, not after the claim (FN8-10125, F1): a
+    /// session is a candidate only when it holds at least
+    /// `criteria.min_observations` observations, spans at least
+    /// `criteria.min_session_duration_secs`, and (when
+    /// `criteria.require_substantive`) is not boundary-only. A session that
+    /// fails any of these gets no claim and no run row, so it neither spends a
+    /// scheduler slot nor leaves a trace, and it becomes a candidate again the
+    /// moment enough new observations arrive.
     ///
     /// # Errors
     /// Propagates any SQL or pool error.
@@ -3473,11 +3518,14 @@ impl ReaderPool {
         &self,
         workspace_id: WorkspaceId,
         project_id: ProjectId,
-        min_session_age_secs: u64,
+        criteria: AutoImproveCandidateCriteria,
         limit: usize,
     ) -> StoreResult<Vec<AutoImproveCandidateSession>> {
         let cutoff = Timestamp::now().as_microsecond().saturating_sub(
-            (min_session_age_secs.min(i64::MAX as u64 / 1_000_000) as i64) * 1_000_000,
+            (criteria
+                .min_session_age_secs
+                .min(i64::MAX as u64 / 1_000_000) as i64)
+                * 1_000_000,
         );
         self.with_conn(move |conn| {
             let watermark: Option<i64> = conn
@@ -3493,7 +3541,7 @@ impl ReaderPool {
             };
 
             let mut stmt = conn.prepare_cached(
-                "SELECT s.id, s.ended_at FROM sessions s \
+                "SELECT s.id, s.ended_at, s.started_at FROM sessions s \
                  WHERE s.workspace_id = ?1 \
                    AND s.project_id = ?2 \
                    AND s.ended_at IS NOT NULL \
@@ -3506,7 +3554,7 @@ impl ReaderPool {
                          AND c.session_id = s.id \
                          AND NOT ( \
                              c.last_failed_at IS NOT NULL \
-                             AND c.attempts < ?6 \
+                             AND c.attempts < ?5 \
                          ) \
                    ) \
                    AND NOT EXISTS ( \
@@ -3515,8 +3563,7 @@ impl ReaderPool {
                          AND r.project_id = s.project_id \
                          AND r.session_id = s.id \
                    ) \
-                 ORDER BY s.ended_at ASC, s.started_at ASC \
-                 LIMIT ?5",
+                 ORDER BY s.ended_at ASC, s.started_at ASC",
             )?;
             let rows = stmt.query_map(
                 params![
@@ -3524,7 +3571,6 @@ impl ReaderPool {
                     project_id.as_bytes(),
                     watermark,
                     cutoff,
-                    limit.min(i64::MAX as usize) as i64,
                     crate::auto_improve::AUTO_IMPROVE_CLAIM_MAX_ATTEMPTS,
                 ],
                 |row| {
@@ -3532,9 +3578,36 @@ impl ReaderPool {
                     Ok((id_bytes, row.get::<_, i64>(1)?))
                 },
             )?;
+            let mut shape = conn.prepare_cached(
+                "SELECT COUNT(*), \
+                        COALESCE(SUM(kind IN ('user-prompt', 'pre-tool-use', 'post-tool-use')), 0), \
+                        COALESCE(MIN(created_at), 0), \
+                        COALESCE(MAX(created_at), 0) \
+                 FROM observations WHERE session_id = ?1",
+            )?;
+            let min_duration_us = criteria
+                .min_session_duration_secs
+                .min(i64::MAX as u64 / 1_000_000) as i64
+                * 1_000_000;
             let mut out = Vec::new();
             for row in rows {
+                if out.len() >= limit {
+                    break;
+                }
                 let (id_bytes, ended_at) = row?;
+                let (count, substantive, first_at, last_at): (i64, i64, i64, i64) = shape
+                    .query_row(params![id_bytes], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                    })?;
+                if usize::try_from(count).unwrap_or(0) < criteria.min_observations {
+                    continue;
+                }
+                if criteria.require_substantive && substantive == 0 {
+                    continue;
+                }
+                if last_at.saturating_sub(first_at) < min_duration_us {
+                    continue;
+                }
                 out.push(AutoImproveCandidateSession {
                     session_id: SessionId::from_slice(&id_bytes)?,
                     ended_at,
